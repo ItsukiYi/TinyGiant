@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+.vscode/
+.idea/
+*.db
+*.sqlite3
+~*.db
+.cache/
+cache/
+
+# 运行时状态与缓存
+_tg_cache/
+_tg_trash/
+.pytest_cache/
+server.log
+last_html_dump.txt
+
+# 模型二进制（通过 download_models.py 或手动下载）
+*.onnx
+*.tflite
+*.task
+_buffalo_s/
+buffalo_s.zip
+
+# 废弃代码与开发草稿
+tgphoto/
+_dev_archive/
+
+# 本地设置
+.claude/settings.local.json
