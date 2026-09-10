@@ -6,6 +6,7 @@ picker.py 自动化测试 — 覆盖路径安全、持久化、删除回收站�
 """
 import os
 import sys
+import json
 import shutil
 import types
 from pathlib import Path
@@ -1014,6 +1015,178 @@ def test_score_groups_dims_passthrough(tmp_path, monkeypatch):
     assert photos[0].score_face == 0
     assert photos[0].score_exp == 0
     assert photos[0].score_contrast == 0
+
+
+# ═══════════════════════════════════════════════════════════
+#  相册根目录管理 + 相册发现
+# ═══════════════════════════════════════════════════════════
+def _mk_album_root(tmp_path, name='root'):
+    """构造相册根目录：root/album_a 含照片，root/album_b 已扫过(state.json)，root/empty 空。"""
+    root = tmp_path / name
+    a = root / 'album_a'; a.mkdir(parents=True)
+    _make_jpg(a / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    _make_jpg(a / 'DSC0002.jpg', '2024:01:01 10:00:05')
+    b = root / 'album_b'; b.mkdir(parents=True)
+    _make_jpg(b / 'DSC0001.jpg', '2024:01:01 11:00:00')
+    (b / '_tg_cache').mkdir()
+    (b / '_tg_cache' / 'state.json').write_text(
+        json.dumps({'photos': {str(b / 'DSC0001.jpg'): {'person_id': 3, 'role_id': 1, 'keep': True}}}),
+        encoding='utf-8')
+    (root / 'empty').mkdir()
+    return root
+
+
+def test_roots_save_load_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, '_roots_path', lambda: tmp_path / 'roots.json')
+    P._save_roots(['D:/a', 'E:/b'])
+    assert P._load_roots() == ['D:/a', 'E:/b']
+    # 缺失文件返回空
+    monkeypatch.setattr(P, '_roots_path', lambda: tmp_path / 'nope.json')
+    assert P._load_roots() == []
+
+
+def test_is_photo_folder(tmp_path):
+    root = _mk_album_root(tmp_path)
+    assert P._is_photo_folder(root / 'album_a') is True       # 直接含照片
+    assert P._is_photo_folder(root / 'album_b') is True       # 有 _tg_cache/state.json
+    assert P._is_photo_folder(root / 'empty') is False        # 空目录
+    assert P._is_photo_folder(root / 'album_a' / 'DSC0001.jpg') is False  # 非目录
+
+
+def test_build_album_index_discovers_photo_folders(tmp_path):
+    root = _mk_album_root(tmp_path)
+    albums = P._build_album_index(root)
+    names = [a['name'] for a in albums]
+    assert 'album_a' in names and 'album_b' in names
+    assert 'empty' not in names          # 空目录被跳过
+    a = next(x for x in albums if x['name'] == 'album_a')
+    assert a['photo_count'] == 2         # 未扫过 → 快速直扫计数
+    assert a['cover_path'].endswith('DSC0001.jpg')
+    assert a['root'] == str(root)
+    b = next(x for x in albums if x['name'] == 'album_b')
+    assert b['photo_count'] == 1         # 已扫过 → 读 state.json
+    assert b['persons'] == [3] and b['roles'] == [1]
+
+
+def test_all_albums_aggregates_roots(tmp_path, monkeypatch):
+    r1 = _mk_album_root(tmp_path, 'root1')
+    r2 = tmp_path / 'root2'; (r2 / 'sub_x').mkdir(parents=True)
+    _make_jpg(r2 / 'sub_x' / 'a.jpg', '2024:02:02 10:00:00')
+    monkeypatch.setattr(P, '_roots_path', lambda: tmp_path / 'roots.json')
+    P._save_roots([str(r1), str(r2)])
+    roots, albums = P._all_albums()
+    assert roots == [str(r1), str(r2)]
+    names = {(a['root'], a['name']) for a in albums}
+    assert (str(r1), 'album_a') in names
+    assert (str(r1), 'album_b') in names
+    assert (str(r2), 'sub_x') in names
+
+
+def test_global_root_prefers_first_configured_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    r1 = _mk_album_root(tmp_path, 'root1')
+    monkeypatch.setattr(P, '_roots_path', lambda: tmp_path / 'roots.json')
+    P._save_roots([str(r1)])
+    assert str(P._global_root()) == str(r1 / '_tg_global')
+    monkeypatch.setattr(P, '_global_root_cache', None)
+
+
+def test_build_album_index_recursive_nested(tmp_path):
+    """照片嵌在多层子目录（如 DCIM/100MSDCF）也应被发现为相册，且跳过 jpgs。"""
+    root = tmp_path / 'root'
+    a = root / '25.12.26-shoot'
+    deep = a / 'DCIM' / '100MSDCF'; deep.mkdir(parents=True)
+    _make_jpg(deep / '_DSC0001.jpg', '2024:12:26 10:00:00')
+    _make_jpg(deep / '_DSC0002.jpg', '2024:12:26 10:00:05')
+    (root / 'empty').mkdir()
+    j = root / 'jpgs'; j.mkdir()
+    _make_jpg(j / 'a.jpg', '2024:12:27 10:00:00')  # SKIP_DIRS 内的目录不当作相册
+    albums = P._build_album_index(root)
+    names = [x['name'] for x in albums]
+    assert '25.12.26-shoot' in names
+    assert 'empty' not in names
+    assert 'jpgs' not in names
+    a_alb = next(x for x in albums if x['name'] == '25.12.26-shoot')
+    assert a_alb['photo_count'] == 2
+    assert a_alb['cover_path'].endswith('_DSC0001.jpg')
+
+
+def test_api_scan_configured_root_returns_albums(tmp_path, monkeypatch):
+    """打开已配置的相册根（仅 1 个子相册，不满足旧启发式）也应返回 albums 视图。"""
+    import threading
+    import urllib.request
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, 'current_dir', '')
+    monkeypatch.setattr(P, 'groups', [])
+    monkeypatch.setattr(P, '_roots_path', lambda: tmp_path / 'roots.json')
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    root = tmp_path / 'camera'
+    a = root / '20240101_shoot'; a.mkdir(parents=True)
+    _make_jpg(a / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    assert P._is_album_root(root) is False  # 仅 1 个子相册，旧启发式识别不出
+    P._save_roots([str(root)])
+    srv = P.ThreadingHTTPServer(('127.0.0.1', 0), P.Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f'http://127.0.0.1:{port}'
+    try:
+        def post(p, body):
+            req = urllib.request.Request(base + p, data=json.dumps(body).encode(),
+                                         headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read().decode())
+
+        d = post('/api/scan', {'directory': str(root)})
+        assert d['ok'] and d['view'] == 'albums'
+        assert [x['name'] for x in d['albums']] == ['20240101_shoot']
+        # 前端打开根后会再 fetch /api/data：此时 scan_root=根目录，仍应为 albums
+        with urllib.request.urlopen(base + '/api/data') as r:
+            d2 = json.loads(r.read().decode())
+        assert d2['view'] == 'albums'
+    finally:
+        srv.shutdown()
+
+
+def test_api_albums_setup_add_remove_flow(tmp_path, monkeypatch):
+    """HTTP 级：首次启动 setup → 添加根 → 相册首页聚合 → 移除回 setup。"""
+    import threading
+    import urllib.request
+    # 隔离：其他测试会改动模块全局，这里全部重置
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, 'current_dir', '')
+    monkeypatch.setattr(P, 'groups', [])
+    monkeypatch.setattr(P, '_roots_path', lambda: tmp_path / 'roots.json')
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    root = tmp_path / 'camera'
+    a = root / '20240101_shoot'; a.mkdir(parents=True)
+    _make_jpg(a / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    (root / 'empty').mkdir()
+    srv = P.ThreadingHTTPServer(('127.0.0.1', 0), P.Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f'http://127.0.0.1:{port}'
+    try:
+        def get(p):
+            with urllib.request.urlopen(base + p) as r:
+                return json.loads(r.read().decode())
+
+        def post(p, body):
+            req = urllib.request.Request(base + p, data=json.dumps(body).encode(),
+                                         headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read().decode())
+
+        assert get('/api/data')['view'] == 'setup'
+        d = post('/api/albums', {'action': 'add', 'path': str(root)})
+        assert d['ok'] and d['roots'] == [str(root.resolve())]
+        d = get('/api/data')
+        assert d['view'] == 'albums'
+        assert [x['name'] for x in d['albums']] == ['20240101_shoot']
+        d = post('/api/albums', {'action': 'remove', 'path': str(root)})
+        assert d['ok'] and d['roots'] == []
+        assert get('/api/data')['view'] == 'setup'
+    finally:
+        srv.shutdown()
 
 
 if __name__ == '__main__':

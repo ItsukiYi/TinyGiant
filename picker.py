@@ -946,13 +946,10 @@ def _restore_state(photos, state: dict) -> None:
         except (TypeError, ValueError):
             pass
 
-def _mark_previously_exported(root: Path, photos: list) -> int:
-    """检测相册内的"挑选_YYYYMMDD_HHMMSS"导出目录，找出其中导出的 ARW 文件名。
-    若这些 ARW 仍存在于原相册（photo.raw 存在），则对应照片标记 keep=True（提醒已导出过）。
-    返回标记的照片数。只读不改，不覆盖用户手动取消的选中。"""
+def _exported_arw_names(root: Path) -> set:
+    """收集相册内所有"挑选_*"导出目录中已导出的 ARW 文件名（去重）。"""
     if not root.is_dir():
-        return 0
-    # 收集所有导出目录里的 ARW 文件名（去重）
+        return set()
     exported = set()
     try:
         for d in root.iterdir():
@@ -964,7 +961,15 @@ def _mark_previously_exported(root: Path, photos: list) -> int:
                 except OSError:
                     continue
     except OSError:
-        return 0
+        pass
+    return exported
+
+
+def _mark_previously_exported(root: Path, photos: list) -> int:
+    """检测相册内的"挑选_YYYYMMDD_HHMMSS"导出目录，找出其中导出的 ARW 文件名。
+    若这些 ARW 仍存在于原相册（photo.raw 存在），则对应照片标记 keep=True（提醒已导出过）。
+    返回标记的照片数。只读不改，不覆盖用户手动取消的选中。"""
+    exported = _exported_arw_names(root)
     if not exported:
         return 0
     # 标记：照片有对应 raw 且 raw 文件名在已导出集合中 → keep=True
@@ -1214,10 +1219,18 @@ def _embed_face(session, aligned_rgb) -> 'np.ndarray | None':
 _global_root_cache: Path | None = None
 
 def _global_root() -> Path:
-    """全局库根目录。优先 scan_root 的父目录（D:/0_camera），回退到 ~/.tgphoto/。"""
+    """全局库根目录。优先第一个配置的相册根目录/_tg_global；
+    否则从 scan_root 上溯启发式；最后回退 ~/.tgphoto/。"""
     global _global_root_cache
     if _global_root_cache is not None:
         return _global_root_cache
+    # 0) 用户配置的相册根目录（roots.json），优先使用第一个
+    roots = _load_roots()
+    if roots:
+        rp = Path(roots[0])
+        if rp.is_dir():
+            _global_root_cache = rp / '_tg_global'
+            return _global_root_cache
     # 1) 如果 scan_root 已设，检测其父目录是否含多个相册子目录
     if scan_root:
         root = Path(scan_root)
@@ -1428,6 +1441,113 @@ def _save_albums(albums: dict) -> None:
     except Exception:
         pass
 
+# ── 相册根目录配置（~/.tgphoto/roots.json，固定位置，独立于 _global_root）──
+def _roots_path() -> Path:
+    return Path.home() / '.tgphoto' / 'roots.json'
+
+def _load_roots() -> list:
+    try:
+        p = _roots_path()
+        if p.exists():
+            data = json.loads(p.read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                return [r for r in data if isinstance(r, str)]
+            if isinstance(data, dict) and isinstance(data.get('roots'), list):
+                return [r for r in data['roots'] if isinstance(r, str)]
+    except Exception:
+        pass
+    return []
+
+def _save_roots(roots: list) -> None:
+    try:
+        p = _roots_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(roots, ensure_ascii=False, indent=1), encoding='utf-8')
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+# ── 照片文件夹检测（相册发现）──────────────────────────
+def _count_photos(dirpath: Path) -> int:
+    """统计目录内直接含有的预览照片数量（不递归）。"""
+    try:
+        return sum(1 for f in dirpath.iterdir()
+                   if f.is_file() and f.suffix in PREVIEW_EXTS and is_real_photo(f))
+    except OSError:
+        return 0
+
+def _album_count_and_cover(dirpath: Path) -> tuple:
+    """递归统计相册照片数并取首张封面（可跨任意深度）。
+
+    跳过 SKIP_DIRS 与隐藏/下划线目录；按文件名过滤 mac 资源叉等小文件，
+    不做 stat（快，实测与 stat 结果一致）。返回 (count, cover_path)。"""
+    count = 0
+    cover = ''
+    try:
+        for dp, dirnames, filenames in os.walk(dirpath):
+            dirnames[:] = [x for x in dirnames if x not in SKIP_DIRS and not x.startswith(('_', '.'))]
+            for fn in filenames:
+                if fn.startswith(('._', '.__')):
+                    continue
+                if fn.lower().endswith(('.jpg', '.jpeg', '.hif', '.heic')):
+                    if not cover:
+                        cover = str(Path(dp) / fn)
+                    count += 1
+    except OSError:
+        pass
+    return count, cover
+
+def _first_photo(dirpath: Path) -> Path | None:
+    """返回目录内第一张预览照片路径（按文件名排序）。"""
+    try:
+        for f in sorted(dirpath.iterdir()):
+            if f.is_file() and f.suffix in PREVIEW_EXTS and is_real_photo(f):
+                return f
+    except OSError:
+        return None
+
+def _is_photo_folder(dirpath: Path) -> bool:
+    """判断子目录是否符合相册要求：已有 _tg_cache 标记，或含预览照片（递归）。"""
+    if not dirpath.is_dir():
+        return False
+    if (dirpath / '_tg_cache' / 'state.json').exists():
+        return True
+    return _album_count_and_cover(dirpath)[0] > 0
+
+def _all_albums() -> tuple:
+    """跨所有已配置相册根目录聚合索引。返回 (roots, albums)。"""
+    roots = _load_roots()
+    albums = []
+    for r in roots:
+        rp = Path(r)
+        if not rp.is_dir():
+            continue
+        albums.extend(_build_album_index(rp))
+    return roots, albums
+
+ALBUM_CACHE_TTL = 300  # 相册索引缓存秒数（避免大相册根每次首页都全量重扫）
+
+def _rebuild_albums(rlist) -> list:
+    """对一组相册根目录重建索引（全量扫描）。"""
+    albums = []
+    for r in rlist:
+        rp = Path(r)
+        if rp.is_dir():
+            albums.extend(_build_album_index(rp))
+    return albums
+
+def _save_album_cache(albums) -> None:
+    _save_albums({'version': 2, 'scanned_at': datetime.now().timestamp(), 'albums': albums})
+
+def _cached_albums(rlist) -> list | None:
+    """返回新鲜缓存索引；无/过期返回 None（调用方重建）。"""
+    cached = _load_albums()
+    ts = cached.get('scanned_at') or 0
+    if cached.get('albums') and (datetime.now().timestamp() - ts) < ALBUM_CACHE_TTL:
+        return cached['albums']
+    return None
+
 def _is_album_root(path: Path) -> bool:
     """检测是否是相册根目录（含多个相册子目录）。"""
     if not path.is_dir():
@@ -1447,11 +1567,13 @@ def _is_album_root(path: Path) -> bool:
     return False
 
 def _build_album_index(root: Path) -> list:
-    """遍历 root 下的子目录，构建相册索引（不扫照片内容，只读 _state.json 元数据）。"""
+    """遍历 root 下的子目录，构建相册索引。
+    有 _tg_cache/state.json 的读元数据；未扫过的目录快速直扫（计数+封面）。
+    跳过不含照片的目录。"""
     import time as _t
     albums = []
     for d in sorted(root.iterdir()):
-        if not d.is_dir() or d.name.startswith('_') or d.name.startswith('.'):
+        if not d.is_dir() or d.name.startswith('_') or d.name.startswith('.') or d.name in SKIP_DIRS:
             continue
         state_path = d / '_tg_cache' / 'state.json'
         photo_count = 0
@@ -1472,10 +1594,21 @@ def _build_album_index(root: Path) -> list:
                         roles.add(v['role_id'])
             except Exception:
                 pass
+        if photo_count == 0:
+            # 未扫过的目录：递归统计（支持 DCIM/子目录等多层结构）
+            photo_count, cover_path = _album_count_and_cover(d)
+            if cover_path:
+                try:
+                    ts = datetime.fromtimestamp(Path(cover_path).stat().st_mtime)
+                    date_str = ts.strftime('%Y-%m-%d')
+                except OSError:
+                    pass
+        if photo_count == 0:
+            continue  # 非照片文件夹，跳过
         albums.append({
             'path': str(d), 'name': d.name, 'photo_count': photo_count,
             'date': date_str, 'persons': sorted(persons), 'roles': sorted(roles),
-            'cover_path': cover_path,
+            'cover_path': cover_path, 'root': str(root),
         })
     return albums
 
@@ -1845,6 +1978,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path == '/api/delete':   return self.api_delete(body)
             if p.path == '/api/scan':     return self.api_scan(body)
             if p.path == '/api/export':   return self.api_export(body)
+            if p.path == '/api/albums':   return self.api_albums(body)
             if p.path == '/api/reassign':  return self.api_reassign(body)
             if p.path == '/api/assign_role': return self.api_assign_role(body)
             if p.path == '/api/score':     return self.api_score(body)
@@ -1930,11 +2064,28 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'ok': True, 'log': data})
 
     def api_data(self):
-        # 相册根目录视图：返回相册列表 + 全局人物/角色库
+        # 视图推断：view=albums 强制相册首页（"返回相册"）；否则按当前状态推断
+        q = parse_qs(urlparse(self.path).query)
+        force_albums = q.get('view', [''])[0] == 'albums'
         try:
-            if scan_root and _is_album_root(Path(scan_root)):
-                albums = _build_album_index(Path(scan_root))
-                _save_albums({'version': 1, 'albums': albums})
+            cur_is_root = bool(scan_root) and _is_album_root(Path(scan_root))
+            roots = _load_roots()
+            scan_is_root = bool(scan_root) and str(Path(scan_root).resolve()) in [str(Path(r).resolve()) for r in roots]
+            # 相册首页：强制返回 / 当前目录是相册根 / 尚未进入具体相册（空 scan_root）
+            if force_albums or cur_is_root or scan_is_root or not scan_root:
+                rlist = list(roots)
+                if (cur_is_root or scan_is_root) and str(Path(scan_root).resolve()) not in rlist:
+                    rlist.append(str(Path(scan_root).resolve()))
+                albums = _cached_albums(rlist)
+                if albums is None:
+                    albums = _rebuild_albums(rlist)
+                    _save_album_cache(albums)
+                if not rlist:
+                    # 首次启动：未配置任何相册根目录 → 引导页
+                    return self._json({
+                        'view': 'setup', 'dir': current_dir or '',
+                        'roots': [], 'albums': [], 'persons': [], 'roles': [],
+                    })
                 persons_db = _load_persons().get('persons', {})
                 roles_db = _load_roles().get('roles', {})
                 all_pids = sorted(persons_db.keys(), key=int)
@@ -1949,7 +2100,8 @@ class Handler(BaseHTTPRequestHandler):
                          for rid in sorted(roles_db.keys(), key=int)]
                 return self._json({
                     'dir': current_dir, 'view': 'albums',
-                    'albums': albums, 'persons': persons, 'roles': roles,
+                    'roots': rlist, 'albums': albums,
+                    'persons': persons, 'roles': roles,
                 })
         except Exception:
             import traceback; traceback.print_exc()
@@ -2080,6 +2232,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # 无 id 时仅允许 scan_root 子树内的路径（防穿越）
             safe = _safe_path(scan_root, unquote(path_str or ''))
+            if (not safe or not safe.exists()):
+                # 相册封面：也允许已配置相册根目录子树内的路径（跨根显示封面）
+                for r in _load_roots():
+                    s = _safe_path(r, unquote(path_str or ''))
+                    if s and s.exists():
+                        safe = s
+                        break
             if not safe or not safe.exists():
                 return self._placeholder()
             path = safe
@@ -2269,8 +2428,9 @@ class Handler(BaseHTTPRequestHandler):
         scan_root = str(Path(directory).resolve())
         current_dir = str(Path(directory).resolve())
         _global_root_cache = None  # 重置缓存以适配新根
-        # 相册根目录：不 scan 照片，只建索引返回相册列表（前端用 /api/data 拿 persons/roles）
-        if _is_album_root(Path(directory)):
+        # 相册根目录：已配置的根或旧启发式识别为根 → 只建索引（前端用 /api/data 拿 persons/roles）
+        root_resolved = str(Path(directory).resolve())
+        if root_resolved in [str(Path(r).resolve()) for r in _load_roots()] or _is_album_root(Path(directory)):
             groups = []
             self._json({'ok': True, 'dir': current_dir, 'view': 'albums',
                         'groups': [], 'albums': _build_album_index(Path(directory))})
@@ -2423,6 +2583,38 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             return self._json({'ok': False, 'error': str(e)})
 
+    def api_albums(self, body):
+        """POST /api/albums → 管理相册根目录。
+        {action:'add', path} / {action:'remove', path} / {action:'rescan'}
+        返回最新 roots + 跨根聚合的相册索引。"""
+        global _global_root_cache
+        action = body.get('action', '')
+        roots = _load_roots()
+        if action == 'add':
+            p = (body.get('path') or '').strip()
+            if not p:
+                return self._json({'ok': False, 'error': '缺少路径'})
+            rp = Path(p).resolve()
+            if not rp.is_dir():
+                return self._json({'ok': False, 'error': '目录不存在: ' + p})
+            rs = [Path(r).resolve() for r in roots]
+            if rp not in rs:
+                roots.append(str(rp))
+                _save_roots(roots)
+        elif action == 'remove':
+            p = (body.get('path') or '').strip()
+            rp = Path(p).resolve()
+            roots = [r for r in roots if Path(r).resolve() != rp]
+            _save_roots(roots)
+        elif action == 'rescan':
+            pass  # 仅重建索引
+        else:
+            return self._json({'ok': False, 'error': '未知操作: ' + str(action)})
+        _global_root_cache = None  # 根目录变化可能影响全局库位置
+        albums = _rebuild_albums(roots)
+        _save_album_cache(albums)
+        return self._json({'ok': True, 'roots': roots, 'albums': albums})
+
     def api_export(self, body):
         import shutil, datetime as dt
         kept = [p for g in groups for p in g if p.keep and p.raw]
@@ -2430,16 +2622,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': False, 'error': '没有选中的 ARW 文件'})
         ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
         export_dir = Path(current_dir) / f'挑选_{ts}'
+        names = [p.raw.name for p in kept]
+        confirmed = body.get('confirmed', False)
+        if not confirmed:
+            # 预览：返回待导出清单 + 已存在于历史导出目录中的文件（提示增量）
+            already = [n for n in names if n in _exported_arw_names(Path(current_dir))]
+            return self._json({
+                'ready': True, 'dir': str(export_dir), 'count': len(names),
+                'files': names[:500], 'already': already, 'already_count': len(already),
+            })
+        # 执行复制：跳过目标目录内已存在的同名文件（幂等，不覆盖）
         export_dir.mkdir(parents=True, exist_ok=True)
-        copied = []
+        copied, skipped = [], []
         for p in kept:
             dst = export_dir / p.raw.name
-            import shutil as _sh
-            _sh.copy2(p.raw, dst)
+            if dst.exists():
+                skipped.append(p.raw.name)
+                continue
+            shutil.copy2(p.raw, dst)
             copied.append(p.raw.name)
         save_state(scan_root, groups)
-        print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}")
-        self._json({'ok': True, 'dir': str(export_dir), 'count': len(copied), 'files': copied})
+        if skipped:
+            print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}（跳过 {len(skipped)} 个已存在）")
+        else:
+            print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}")
+        self._json({'done': True, 'dir': str(export_dir), 'count': len(copied),
+                    'skipped': len(skipped), 'files': copied})
 
     def api_delete(self, body):
         confirmed = body.get('confirmed', False)
@@ -2491,27 +2699,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e0e0e0;overflow:hidden;height:100vh}
-.hdr{position:sticky;top:0;z-index:99;background:#252525}
-.hdr-top{display:flex;align-items:center;gap:10px;padding:8px 16px;flex-wrap:wrap}
-.hdr-top h1{font-size:15px;color:#fff;white-space:nowrap}
-.hdr-top .dir-row{display:flex;align-items:center;gap:6px;flex:1 1 300px;min-width:200px}
-.hdr-top .dir-row input{flex:1;background:#1a1a1a;border:1px solid #444;border-radius:4px;padding:5px 10px;color:#ddd;font-size:12px;outline:none}
-.hdr-top .dir-row input:focus{border-color:#666}
-.hdr-top .dir-row .btn-open{background:#2980b9;color:#fff;padding:5px 10px;font-size:12px;cursor:pointer}
-.hdr-top .dir-row .btn-open:hover{background:#2471a3}
-.hdr-top .dir-row .btn-open:disabled{background:#444;color:#666;cursor:default}
+.hdr{position:sticky;top:0;z-index:99;background:#252525;border-bottom:1px solid #333}
+.menubar{display:flex;align-items:center;gap:2px;height:32px;padding:0 8px;background:#2b2b2b;border-bottom:1px solid #222}
+.app-title{font-size:13px;font-weight:600;color:#fff;padding:0 10px;white-space:nowrap;user-select:none}
+.menu{position:relative}
+.mi-title{padding:5px 10px;font-size:12px;color:#ccc;border-radius:4px;cursor:default;user-select:none;white-space:nowrap}
+.mi-title:hover{background:#3a3a3a;color:#fff}
+.menu.open .mi-title{background:#3d6df0;color:#fff}
+.menu-drop{display:none;position:absolute;top:100%;left:0;min-width:220px;background:#2e2e2e;border:1px solid #444;border-radius:6px;padding:4px;box-shadow:0 10px 28px rgba(0,0,0,.55);z-index:310}
+.menu.open .menu-drop{display:block}
+.mi{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 10px;font-size:12px;color:#ddd;background:none;border:none;border-radius:4px;cursor:pointer;white-space:nowrap}
+.mi:hover:not(:disabled){background:#3d6df0;color:#fff}
+.mi:disabled{color:#555;cursor:default}
+.mi .kbd{margin-left:auto;font-size:10px;color:#777}
+.mi:hover:not(:disabled) .kbd{color:#bbb}
+.mi .chk{width:14px;text-align:center;color:#5bdc78;font-size:12px}
+.mi-sep{height:1px;background:#444;margin:4px 6px}
+.toolbar{display:flex;align-items:center;gap:8px;padding:5px 12px;flex-wrap:wrap;background:#1f1f1f}
+.dir-row{display:flex;align-items:center;gap:6px;flex:1 1 300px;min-width:200px}
+.dir-row input{flex:1;background:#1a1a1a;border:1px solid #444;border-radius:4px;padding:5px 10px;color:#ddd;font-size:12px;outline:none}
+.dir-row input:focus{border-color:#666}
+.btn-open{background:#2980b9;color:#fff;padding:5px 10px;font-size:12px;cursor:pointer}
+.btn-open:hover{background:#2471a3}
+.btn-open:disabled{background:#444;color:#666;cursor:default}
 .stats{color:#999;font-size:12px;white-space:nowrap}
 .btn{padding:6px 14px;border:none;border-radius:4px;font-size:12px;cursor:pointer;white-space:nowrap}
 .del{background:#c0392b;color:#fff}
 .del:hover{background:#a93226}
 .del:disabled{background:#444;color:#666;cursor:default}
-.del-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 16px 6px;background:#1f1f1f;border-bottom:1px solid #333}
+.export{background:#2980b9;color:#fff}
+.export:hover{background:#2471a3}
+.export:disabled{background:#444;color:#666;cursor:default}
+.del-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .del-row label{display:flex;align-items:center;gap:3px;cursor:pointer;color:#bbb;font-size:12px;white-space:nowrap}
 .del-row label:hover{color:#ddd}
 .del-row select{background:#333;border:1px solid #555;border-radius:3px;color:#ddd;padding:2px 6px;font-size:12px;cursor:pointer;outline:none}
 .del-row select:hover{border-color:#777}
 .del-row input[type=checkbox]{accent-color:#2980b9;margin:0}
-.layout{display:flex;height:calc(100vh - 80px)}
+.layout{display:flex;height:calc(100vh - 70px)}
 .main{flex:1;overflow-y:auto;min-width:0}
 .main.side-open{flex:0 0 calc(100% - 480px)}
 .side{width:480px;border-left:1px solid #333;display:flex;flex-direction:column;background:#222;position:relative}
@@ -2534,7 +2759,7 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .card:hover{border-color:#777}
 .card.sel{border-color:#27ae60;background:#142814}
 .card.lsel{border-color:#2980b9;box-shadow:0 0 6px rgba(41,128,185,.5)}
-#labelPanel{position:fixed;top:80px;left:0;bottom:0;width:200px;background:#1f1f1f;border-right:1px solid #333;z-index:90;display:none;flex-direction:column;overflow-y:auto;padding:8px}
+#labelPanel{position:fixed;top:70px;left:0;bottom:0;width:200px;background:#1f1f1f;border-right:1px solid #333;z-index:90;display:none;flex-direction:column;overflow-y:auto;padding:8px}
 #labelPanel.on{display:flex}
 #labelPanel h3{font-size:12px;color:#888;margin:8px 0 4px;border-bottom:1px solid #333;padding-bottom:4px}
 #labelPanel .lp-item{display:flex;align-items:center;gap:6px;padding:4px 6px;cursor:pointer;border-radius:4px;font-size:12px;color:#ccc}
@@ -2561,6 +2786,20 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .ameta{font-size:10px;color:#666;margin-top:2px}
 .adots{display:flex;gap:2px;margin-top:4px}
 .adots .pdot{width:8px;height:8px;border-radius:2px}
+.aroot{width:100%;margin-top:4px}
+.aroot-hdr{display:flex;align-items:center;gap:10px;padding:6px 2px;border-bottom:1px solid #2c2c2c;margin-bottom:4px}
+.aroot-name{font-size:13px;color:#eee;font-weight:600;white-space:nowrap}
+.aroot-path{font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.aroot-cnt{font-size:11px;color:#999;white-space:nowrap}
+.aroot-grid{display:flex;flex-wrap:wrap;gap:12px;padding:4px 0}
+.aroot-row{display:flex;align-items:center;gap:8px;background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:5px 10px;margin:4px 0;font-size:12px;color:#ccc}
+.aroot-row span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.setup{max-width:580px;margin:60px auto 0;padding:24px;background:#1f1f1f;border:1px solid #333;border-radius:10px}
+.setup h2{font-size:18px;color:#fff;margin-bottom:8px}
+.setup-sub{font-size:13px;color:#aaa;line-height:1.7}
+.setup-sub code{background:#111;padding:1px 5px;border-radius:3px;color:#7ec8ff}
+#albumRootInput:focus{border-color:#666}
+#setupRootInput:focus{border-color:#666}
 .pbar .plabel{font-size:14px}
 .pbar .pchip{font-size:11px;padding:3px 10px;border:1px solid;border-radius:14px;cursor:pointer;color:#ddd;background:#2a2a2a;transition:.12s}
 .pbar .pchip:hover{filter:brightness(1.2)}
@@ -2584,41 +2823,72 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 #logPanel.on{display:block}
 #logPanel .le{white-space:pre-wrap;word-break:break-all}
 #logPanel .lw{color:#fff}
-@media(max-width:900px){.side{position:fixed;right:0;top:80px;bottom:0;width:100%;z-index:150}.side.closed{display:none}.main.side-open{flex:1}}
+@media(max-width:900px){.side{position:fixed;right:0;top:70px;bottom:0;width:100%;z-index:150}.side.closed{display:none}.main.side-open{flex:1}}
 </style>
 </head>
 <body>
 <div class="hdr">
-  <div class="hdr-top">
-    <h1>📷 连拍挑选</h1>
+  <div class="menubar">
+    <span class="app-title">📷 连拍挑选</span>
+    <div class="menu" data-menu="file">
+      <span class="mi-title" onclick="toggleMenu(this)">文件</span>
+      <div class="menu-drop">
+        <button class="mi" onclick="focusDir()">打开目录…<span class="kbd">Ctrl+O</span></button>
+        <button class="mi" onclick="browseDir()">浏览文件夹…</button>
+        <button class="mi" id="backBtn" onclick="backToAlbums()">返回相册</button>
+        <div class="mi-sep"></div>
+        <button class="mi" id="exportMi" onclick="exportARW()">导出 ARW<span class="kbd" id="exportMiCnt"></span></button>
+        <div class="mi-sep"></div>
+        <button class="mi" onclick="openAlbumPanel()">相册管理…<span class="kbd" id="albumRootCnt"></span></button>
+      </div>
+    </div>
+    <div class="menu" data-menu="view">
+      <span class="mi-title" onclick="toggleMenu(this)">视图</span>
+      <div class="menu-drop">
+        <button class="mi" id="filterBtn" onclick="toggleFilterPanel()"><span class="chk"></span>筛选…</button>
+        <button class="mi" id="labelBtn" onclick="toggleLabel()"><span class="chk" id="labelChk"></span>标注模式</button>
+        <div class="mi-sep"></div>
+        <button class="mi" id="debugBtn" onclick="toggleDebug()"><span class="chk" id="debugChk"></span>调试</button>
+        <button class="mi" id="logBtn" onclick="toggleLog()"><span class="chk" id="logChk"></span>日志</button>
+      </div>
+    </div>
+    <div class="menu" data-menu="score">
+      <span class="mi-title" onclick="toggleMenu(this)">评分</span>
+      <div class="menu-drop">
+        <button class="mi" id="scoreBtn" onclick="openScorePanel()"><span class="chk"></span>评分配置…</button>
+      </div>
+    </div>
+    <div class="menu" data-menu="help">
+      <span class="mi-title" onclick="toggleMenu(this)">帮助</span>
+      <div class="menu-drop">
+        <button class="mi" id="reloadBtn" onclick="hotReload(event)" title="点击=仅前端热更新，Shift+点击=重启整个服务">热更新前端<span class="kbd">Shift=重启</span></button>
+        <button class="mi" onclick="aboutInfo()">使用说明…</button>
+      </div>
+    </div>
+    <span class="stats" id="st" style="margin-left:auto;padding-right:10px">加载中…</span>
+  </div>
+  <div class="toolbar">
     <div class="dir-row">
       <input id="dirInput" type="text" placeholder="D:\0_camera\..." value="" onkeydown="if(event.key==='Enter')openDir()">
       <button class="btn btn-open" id="openBtn" onclick="openDir()">打开</button>
       <button class="btn" style="background:#555;color:#ccc;padding:5px 10px" onclick="browseDir()">📂 浏览</button>
+      <button class="btn" id="homeBtn" onclick="backToAlbums()" style="display:none;background:#27ae60;color:#fff;font-weight:600" title="返回相册主界面">⌂ 主界面</button>
     </div>
-    <span class="stats" id="st">加载中…</span>
-    <button class="btn" id="backBtn" onclick="backToAlbums()" style="background:#555;color:#ccc;padding:4px 8px;font-size:10px;display:none">← 相册</button>
-    <button class="btn" id="scoreBtn" onclick="openScorePanel()" style="background:#e67e22;color:#fff;padding:4px 8px;font-size:10px;display:none">⚡ 评分</button>
-    <button class="btn" id="filterBtn" onclick="toggleFilterPanel()" style="background:#16a085;color:#fff;padding:4px 8px;font-size:10px;display:none">🎚 筛选</button>
-    <button class="btn" id="debugBtn" onclick="toggleDebug()" style="background:#555;color:#ccc;padding:4px 8px;font-size:10px">🔍 调试关</button>
-    <button class="btn" id="logBtn" onclick="toggleLog()" style="background:#555;color:#ccc;padding:4px 8px;font-size:10px">📋 日志关</button>
-    <button class="btn" id="reloadBtn" onclick="hotReload()" style="background:#555;color:#ccc;padding:4px 8px;font-size:10px" title="点击=仅前端热更新，Shift+点击=重启整个服务">🔄 热更新</button>
-    <button class="btn" id="labelBtn" onclick="toggleLabel()" style="background:#555;color:#ccc;padding:4px 8px;font-size:10px">📝 标注</button>
-  </div>
-  <div class="del-row" id="delBar">
-    <span style="color:#999;font-size:12px">🗑️</span>
-    <select id="delMode" onchange="updDelBtn()">
-      <option value="selected">选中的</option>
-      <option value="unselected">未选中的</option>
-    </select>
-    <span style="color:#555">|</span>
-    <label><input type="checkbox" id="tJPG" checked onchange="updDelBtn()">JPG</label>
-    <label><input type="checkbox" id="tHIF" onchange="updDelBtn()">HIF/HEIC</label>
-    <label><input type="checkbox" id="tRAW" checked onchange="updDelBtn()">ARW</label>
-    <span class="stats" id="delPreview" style="font-size:11px;color:#888"></span>
-    <span style="flex:1"></span>
-    <button class="btn" style="background:#2980b9;color:#fff;padding:6px 14px;font-size:12px" id="exportBtn" onclick="exportARW()" disabled>导出ARW</button>
-    <button class="btn del" id="delBtn" onclick="execDel()" disabled>删除</button>
+    <div class="del-row" style="flex:1 1 auto;min-width:0">
+      <span style="color:#999;font-size:12px">🗑️</span>
+      <select id="delMode" onchange="updDelBtn()">
+        <option value="selected">选中的</option>
+        <option value="unselected">未选中的</option>
+      </select>
+      <span style="color:#555">|</span>
+      <label><input type="checkbox" id="tJPG" checked onchange="updDelBtn()">JPG</label>
+      <label><input type="checkbox" id="tHIF" onchange="updDelBtn()">HIF/HEIC</label>
+      <label><input type="checkbox" id="tRAW" checked onchange="updDelBtn()">ARW</label>
+      <span class="stats" id="delPreview" style="font-size:11px;color:#888"></span>
+      <span style="flex:1"></span>
+      <button class="btn export" id="exportBtn" onclick="exportARW()" disabled>导出ARW</button>
+      <button class="btn del" id="delBtn" onclick="execDel()" disabled>删除</button>
+    </div>
   </div>
 </div>
 <div id="mergeBar" style="display:none;background:#1a1a2e;border-bottom:1px solid #333;padding:4px 16px;gap:6px;flex-wrap:wrap;align-items:center"></div>
@@ -2691,6 +2961,25 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
     </div>
   </div>
 </div>
+
+<!-- 相册管理面板 -->
+<div class="modal" id="albumPanel">
+  <div class="mc" style="max-width:560px">
+    <h2>🗂 相册管理</h2>
+    <p style="color:#888;font-size:12px">添加一个或多个相册根目录（如 D:\0_camera），自动检索底下的照片文件夹。全局人物/角色库保存在第一个相册根目录的 <code>_tg_global</code>。</p>
+    <div id="albumRootList"></div>
+    <div style="display:flex;gap:6px;margin:10px 0">
+      <input id="albumRootInput" type="text" placeholder="相册根目录路径" style="flex:1;background:#1a1a1a;border:1px solid #444;border-radius:4px;padding:5px 10px;color:#ddd;font-size:12px;outline:none" onkeydown="if(event.key==='Enter')addAlbumRoot()">
+      <button class="btn" onclick="browseAlbumRoot()">浏览…</button>
+      <button class="btn" style="background:#2980b9;color:#fff" onclick="addAlbumRoot()">添加</button>
+    </div>
+    <div class="ma">
+      <button class="btn btn-cancel" onclick="closeAlbumPanel()">关闭</button>
+      <button class="btn" onclick="rescanAlbums()">重新扫描</button>
+    </div>
+  </div>
+</div>
+
 <div id="logPanel"></div>
 
 <script>
@@ -2701,15 +2990,19 @@ let LABEL_MODE=false, LABEL_SEL=new Set();
 
 const PV={el:null,wrap:null,img:null,scale:1,tx:0,ty:0,drag:false,dsx:0,dsy:0,dtx:0,dty:0};
 
-async function load(){const r=await fetch('/api/data');const d=await r.json();DATA=d;
-  VIEW=d.view==='albums'?'albums':'photos';
+async function load(v){const u=v==='albums'?'/api/data?view=albums':'/api/data';
+  const _g=document.getElementById('grp');if(_g)_g.innerHTML='<div style="padding:48px"><div class="spin"></div></div>';
+  const r=await fetch(u);const d=await r.json();DATA=d;
+  VIEW=d.view==='albums'?'albums':(d.view==='setup'?'setup':'photos');
   if(VIEW==='albums') ALBUM_ROOT=DATA.dir;
-  render();updateButtons()}
+  render();updateButtons();updRootCnt()}
+function updRootCnt(){const rc=document.getElementById('albumRootCnt');if(rc)rc.textContent=(DATA.roots||[]).length?('· '+(DATA.roots||[]).length):''}
 function render(){
-  if(VIEW==='albums')return renderAlbums();
-  if(VIEW==='persons')return renderPersons();
-  if(VIEW==='person_photos')return renderPersonPhotos();
-  renderPhotos()}
+  if(VIEW==='setup'){renderSetup();return updateButtons()}
+  if(VIEW==='albums'){renderAlbums();return updateButtons()}
+  if(VIEW==='persons'){renderPersons();return updateButtons()}
+  if(VIEW==='person_photos'){renderPersonPhotos();return updateButtons()}
+  renderPhotos();updateButtons()}
 function _pname(pid){const ps=(DATA.persons||[]).find(x=>x.id===pid);return ps&&ps.name?ps.name:'人物'+pid}
 function _rname(rid){const rs=(DATA.roles||[]).find(x=>x.id===rid);return rs&&rs.name?rs.name:'角色'+rid}
 function _pcol(pid){const P=['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#e91e63','#00bcd4','#f1c40f'];return P[pid%P.length]}
@@ -2789,25 +3082,137 @@ function _pcol(pid){const P=['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','
 function setFilter(pid){FILTER_PID=pid;FILTER_GROUP=null;render()}
 function setGroupFilter(pid){FILTER_GROUP=FILTER_GROUP===pid?null:pid;FILTER_PID=null;render()}
 
-// ── 相册列表视图 ──────────────────────────────
+// ── 相册列表视图（跨根目录聚合）──────────────
+function _albumCard(a){
+  const pColors=(a.persons||[]).map(pid=>`<span class="pdot" style="background:${_pcol(pid)}"></span>`).join('');
+  return `<div class="acard" onclick="openAlbum('${a.path.replace(/\\/g,'\\\\\\\\')}')">
+    <div class="acover"><img src="/thumb?p=${encodeURIComponent(a.cover_path||a.path)}&v=${CACHE_BUST}" loading="lazy" onerror="this.style.display='none'"></div>
+    <div class="ainfo"><div class="aname">${a.name}</div>
+    <div class="ameta">${a.photo_count}张 · ${a.date||''}</div>
+    <div class="adots">${pColors}</div></div></div>`;
+}
+function _rootName(r){const p=r.replace(/\\/g,'/').replace(/\/$/,'');const i=p.lastIndexOf('/');return i>=0?p.substring(i+1):p}
 function renderAlbums(){
   document.getElementById('dirInput').value=DATA.dir||'';
-  const albums=DATA.albums||[];
+  let albums=DATA.albums||[], roots=DATA.roots||[];
+  if(!roots.length && albums.length){
+    // 兼容无 roots 的数据（如 /api/scan 直返）：按 album.root 字段归组
+    roots=[...new Set(albums.map(a=>a.root))];
+  }
   let h='<div class="albums">';
   h+=`<div class="abanner"><h2>📷 ${albums.length} 个相册</h2>`;
   h+=`<button class="btn" style="background:#2980b9;color:#fff" onclick="VIEW='persons';loadPersons()">👤 人物库 (${(DATA.persons||[]).length})</button> `;
-  h+=`<button class="btn" style="background:#8e44ad;color:#fff" onclick="VIEW='roles';loadRoles()">🎭 角色库 (${(DATA.roles||[]).length})</button></div>`;
-  albums.forEach(a=>{
-    const pColors=(a.persons||[]).map(pid=>`<span class="pdot" style="background:${_pcol(pid)}"></span>`).join('');
-    h+=`<div class="acard" onclick="openAlbum('${a.path.replace(/\\/g,'\\\\\\\\')}')">
-      <div class="acover"><img src="/thumb?p=${encodeURIComponent(a.cover_path||a.path)}&v=${CACHE_BUST}" loading="lazy" onerror="this.style.display='none'"></div>
-      <div class="ainfo"><div class="aname">${a.name}</div>
-      <div class="ameta">${a.photo_count}张 · ${a.date||''}</div>
-      <div class="adots">${pColors}</div></div></div>`;
+  h+=`<button class="btn" style="background:#8e44ad;color:#fff" onclick="VIEW='roles';loadRoles()">🎭 角色库 (${(DATA.roles||[]).length})</button> `;
+  h+=`<button class="btn" style="background:#27ae60;color:#fff" onclick="openAlbumPanel()">➕ 添加/管理相册</button></div>`;
+  if(!albums.length&&!roots.length){
+    h+=`<div class="note" style="padding:24px">还没有相册。点击右上角「➕ 添加/管理相册」，添加照片根目录（如 D:\\0_camera）后会自动检索。</div>`;
+  }
+  roots.forEach(r=>{
+    const subs=albums.filter(a=>a.root===r);
+    h+=`<div class="aroot"><div class="aroot-hdr"><span class="aroot-name">📁 ${_rootName(r)}</span><span class="aroot-path" title="${r}">${r}</span><span class="aroot-cnt">${subs.reduce((s,a)=>s+a.photo_count,0)}张 · ${subs.length}个相册</span></div>`;
+    if(!subs.length){
+      h+=`<div class="note" style="text-align:left;padding:6px 2px">该目录下没有找到符合要求的照片文件夹（直接含 JPG/HIF/HEIC）。</div>`;
+    }else{
+      h+='<div class="aroot-grid">'+subs.map(_albumCard).join('')+'</div>';
+    }
+    h+='</div>';
   });
   h+='</div>';
   document.getElementById('grp').innerHTML=h;
   document.getElementById('st').textContent=`${albums.length} 个相册 · ${(DATA.persons||[]).length} 人物 · ${(DATA.roles||[]).length} 角色`;
+}
+
+// ── 首次启动引导页 ──────────────────────────────
+function renderSetup(){
+  document.getElementById('dirInput').value='';
+  const h=`<div class="setup">
+    <h2>📷 欢迎使用 连拍挑选</h2>
+    <p class="setup-sub">添加一个或多个<b>相册根目录</b>（如 <code>D:\\0_camera</code>），程序会自动检索底下的照片文件夹并集中展示，方便统一挑选与管理。之后可在「文件 → 相册管理…」中随时增删。</p>
+    <div style="display:flex;gap:6px;margin:16px 0">
+      <input id="setupRootInput" type="text" placeholder="D:\\0_camera" style="flex:1;background:#1a1a1a;border:1px solid #444;border-radius:4px;padding:7px 12px;color:#ddd;font-size:13px;outline:none" onkeydown="if(event.key==='Enter')addSetupRoot()">
+      <button class="btn" onclick="browseSetupRoot()">浏览…</button>
+      <button class="btn" style="background:#2980b9;color:#fff" onclick="addSetupRoot()">添加</button>
+    </div>
+    <div id="setupRootList" style="margin:6px 0"></div>
+    <div class="ma"><button class="btn" style="background:#27ae60;color:#fff" onclick="finishSetup()">开始使用 →</button></div>
+  </div>`;
+  document.getElementById('grp').innerHTML=h;
+  document.getElementById('st').textContent='首次启动 · 添加相册根目录';
+  renderSetupRootList();
+}
+function renderSetupRootList(){
+  const el=document.getElementById('setupRootList');if(!el)return;
+  const roots=DATA.roots||[];
+  el.innerHTML=roots.length
+    ? roots.map(r=>`<div class="aroot-row"><span title="${r}">📁 ${r}</span><button class="btn" style="background:#c0392b;color:#fff;padding:2px 10px" onclick="removeSetupRoot('${r.replace(/'/g,"\\'")}')">移除</button></div>`).join('')
+    : '<div class="note" style="text-align:left;padding:6px 2px;color:#888">还没有相册根目录。</div>';
+}
+async function addSetupRoot(){
+  const inp=document.getElementById('setupRootInput');const p=(inp.value||'').trim();
+  if(!p){alert('请输入目录路径');return}
+  const d=await apiAlbums({action:'add',path:p});
+  if(!d.ok){alert(d.error||'添加失败');return}
+  inp.value='';syncAlbumsData(d);renderSetupRootList();
+}
+async function browseSetupRoot(){
+  try{const r=await fetch('/api/browse',{method:'POST'});const d=await r.json();
+    if(d.ok&&d.path)document.getElementById('setupRootInput').value=d.path;
+  }catch(e){alert('浏览失败: '+e.message)}
+}
+async function removeSetupRoot(path){
+  const d=await apiAlbums({action:'remove',path});
+  if(!d.ok){alert(d.error||'移除失败');return}
+  syncAlbumsData(d);renderSetupRootList();
+}
+function finishSetup(){VIEW='albums';load('albums')}
+
+// ── 相册管理（弹窗）─────────────────────────────
+async function apiAlbums(body){
+  const r=await fetch('/api/albums',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return r.json();
+}
+function syncAlbumsData(d){
+  if(d&&d.ok!==false){
+    DATA.roots=d.roots||DATA.roots||[];
+    DATA.albums=d.albums||DATA.albums||[];
+  }
+}
+function openAlbumPanel(){
+  document.getElementById('albumPanel').classList.add('on');
+  renderAlbumRootList();
+}
+function closeAlbumPanel(){document.getElementById('albumPanel').classList.remove('on')}
+function renderAlbumRootList(){
+  const el=document.getElementById('albumRootList');if(!el)return;
+  const roots=DATA.roots||[];
+  el.innerHTML=roots.length
+    ? roots.map(r=>`<div class="aroot-row"><span title="${r}">📁 ${r}</span><button class="btn" style="background:#c0392b;color:#fff;padding:2px 10px" onclick="removeAlbumRoot('${r.replace(/'/g,"\\'")}')">移除</button></div>`).join('')
+    : '<div class="note" style="text-align:left;padding:8px 2px">尚未添加相册根目录。</div>';
+}
+async function addAlbumRoot(){
+  const inp=document.getElementById('albumRootInput');const p=(inp.value||'').trim();
+  if(!p){alert('请输入目录路径');return}
+  const d=await apiAlbums({action:'add',path:p});
+  if(!d.ok){alert(d.error||'添加失败');return}
+  inp.value='';syncAlbumsData(d);
+  renderAlbumRootList();render();updRootCnt();
+}
+async function browseAlbumRoot(){
+  try{const r=await fetch('/api/browse',{method:'POST'});const d=await r.json();
+    if(d.ok&&d.path)document.getElementById('albumRootInput').value=d.path;
+  }catch(e){alert('浏览失败: '+e.message)}
+}
+async function removeAlbumRoot(path){
+  const d=await apiAlbums({action:'remove',path});
+  if(!d.ok){alert(d.error||'移除失败');return}
+  syncAlbumsData(d);
+  renderAlbumRootList();render();updRootCnt();
+}
+async function rescanAlbums(){
+  const d=await apiAlbums({action:'rescan'});
+  if(!d.ok){alert(d.error||'扫描失败');return}
+  syncAlbumsData(d);
+  renderAlbumRootList();render();updRootCnt();
 }
 async function loadPersons(){
   const d=await(await fetch('/api/persons')).json();
@@ -2826,6 +3231,7 @@ function renderPersons(){
   });
   h+='</div>';
   document.getElementById('grp').innerHTML=h;
+  updateButtons();
 }
 async function openPersonPhotos(pid){
   VIEW='person_photos';
@@ -2846,6 +3252,7 @@ function renderPersonPhotos(){
   });
   h+='</div>';
   document.getElementById('grp').innerHTML=h;
+  updateButtons();
 }
 async function loadRoles(){
   const d=await(await fetch('/api/roles')).json();
@@ -2857,6 +3264,7 @@ function renderRoles(){
   let h='<div class="albums"><div class="abanner"><h2>🎭 角色库 (${roles.length})</h2>';
   h+=`<button class="btn" onclick="VIEW='albums';load()">← 返回相册</button></div></div>`;
   document.getElementById('grp').innerHTML=h;
+  updateButtons();
 }
 
 // ── 人物合并 ──────────────────────────────────
@@ -2911,8 +3319,8 @@ async function loadMergeSuggestions(){
 // ── 标注模式 ──────────────────────────────────
 function toggleLabel(){
   LABEL_MODE=!LABEL_MODE;
-  document.getElementById('labelBtn').textContent=LABEL_MODE?'📝 标注开':'📝 标注';
-  document.getElementById('labelBtn').style.background=LABEL_MODE?'#2980b9':'#555';
+  const chk=document.getElementById('labelChk');
+  if(chk)chk.textContent=LABEL_MODE?'✓':'';
   document.getElementById('labelPanel').classList.toggle('on',LABEL_MODE);
   if(!LABEL_MODE) LABEL_SEL.clear();
   render();
@@ -3030,30 +3438,23 @@ function openAlbum(path){
   openDir();
 }
 function backToAlbums(){
-  // 返回相册根目录（记住的 ALBUM_ROOT，或上溯 DATA.dir）
-  let p=ALBUM_ROOT;
-  if(!p){
-    p=DATA.dir||'';
-    p=p.replace(/\\/g,'/').replace(/\/$/,'');
-    const idx=p.lastIndexOf('/');
-    if(idx>0) p=p.substring(0,idx);
-  }
-  document.getElementById('dirInput').value=p;
-  openDir();
+  // 回到相册首页（跨根聚合）；未配置根时后端返回引导页
+  ALBUM_ROOT='';
+  VIEW='albums';
+  load('albums');
 }
 function updateButtons(){
-  const back=document.getElementById('backBtn');
-  const score=document.getElementById('scoreBtn');
-  const filter=document.getElementById('filterBtn');
-  if(VIEW==='photos'){
-    back.style.display='inline-block';
-    score.style.display='inline-block';
-    filter.style.display='inline-block';
-  }else{
-    back.style.display='none';
-    score.style.display='none';
-    filter.style.display='none';
-  }
+  const inPhotos = VIEW==='photos';
+  const atHome = VIEW==='albums'||VIEW==='setup';
+  // 主界面按钮：进入相册/人物/角色后显示，首页隐藏
+  const hb=document.getElementById('homeBtn');
+  if(hb)hb.style.display=atHome?'none':'inline-block';
+  const b=document.getElementById('backBtn');
+  if(b)b.disabled=atHome;
+  ['scoreBtn','filterBtn'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el)el.disabled=!inPhotos;
+  });
 }
 
 // ── 评分配置面板 ──────────────────────────
@@ -3082,14 +3483,12 @@ async function confirmScoring(){
   if(!dims.length){alert('请至少选择一个评分维度');return}
   window._scoreDims=dims;
   closeScorePanel();
-  const btn=document.getElementById('scoreBtn');
-  btn.disabled=true;btn.textContent='评分中…';
   try{
     const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dims:dims})});
     const d=await r.json();
-    if(!d.ok){alert('评分启动失败: '+d.error);btn.disabled=false;btn.textContent='⚡ 评分';return}
+    if(!d.ok){alert('评分启动失败: '+d.error);return}
     pollScores()
-  }catch(e){alert('评分失败: '+e.message);btn.disabled=false;btn.textContent='⚡ 评分'}
+  }catch(e){alert('评分失败: '+e.message)}
 }
 
 // ── 筛选面板 ──────────────────────────
@@ -3136,8 +3535,6 @@ async function pollScores(){
   for(let i=0;i<600;i++){
     let s;try{s=await(await fetch('/api/status')).json()}catch(e){return}
     if(s.scoring_busy){
-      const btn=document.getElementById('scoreBtn');
-      if(btn)btn.textContent=`评分中…(${i*3}s)`;
       document.getElementById('st').textContent=`${TP}张 · ${GROUPS.length}组 · 评分中…(${i*3}s)`;
       await new Promise(r=>setTimeout(r,3000))
     }else{
@@ -3161,13 +3558,35 @@ async function browseDir(){
 async function exportARW(){
   const md=document.getElementById('md'),mb=document.getElementById('mb');
   md.classList.add('on');
+  mb.innerHTML='<div class="spin"></div><p style="text-align:center;color:#999">正在统计待导出 ARW…</p>';
+  try{
+    const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:false})});
+    const d=await r.json();
+    if(!d.ok){mb.innerHTML='<p>'+esc(d.error)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>';return}
+    let fl=(d.files||[]).map(f=>'<div>'+esc(f)+'</div>').join('');
+    if(d.files.length<d.count)fl+='<div style="color:#555">…还有'+(d.count-d.files.length)+'个</div>';
+    const alreadyNote=(d.already_count>0)?`<p style="font-size:12px;color:#e67e22">⚠ 其中 ${d.already_count} 个已在历史导出目录中出现过</p>`:'';
+    mb.innerHTML=`<h2 style="color:#2980b9">导出 ARW</h2>
+      <p>将复制 <b>${d.count}</b> 个 ARW 到:</p>
+      <p style="font-size:12px;color:#888;word-break:break-all">${esc(d.dir)}</p>
+      ${alreadyNote}
+      <div class="flist">${fl}</div>
+      <div class="ma">
+        <button class="btn btn-cancel" onclick="md.classList.remove('on')">取消</button>
+        <button class="btn export" onclick="exportARWConfirm()">确认导出</button>
+      </div>`
+  }catch(e){mb.innerHTML='<p>导出失败: '+esc(e.message)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>'}
+}
+
+async function exportARWConfirm(){
+  const md=document.getElementById('md'),mb=document.getElementById('mb');
   mb.innerHTML='<div class="spin"></div><p style="text-align:center;color:#999">正在导出 ARW…</p>';
   try{
-    const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});
     const d=await r.json();
     if(!d.ok){mb.innerHTML='<p>'+esc(d.error)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>';return}
     mb.innerHTML=`<h2 style="color:#27ae60">导出完成</h2>
-      <p>已复制 ${d.count} 个 ARW 文件到:</p>
+      <p>已复制 ${d.count} 个 ARW${d.skipped?`，跳过 ${d.skipped} 个已存在`:''}到:</p>
       <p style="font-size:12px;color:#888;word-break:break-all">${esc(d.dir)}</p>
       <div class="ma"><button class="btn refresh" onclick="md.classList.remove('on')">关闭</button></div>`
   }catch(e){mb.innerHTML='<p>导出失败: '+esc(e.message)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>'}
@@ -3271,7 +3690,8 @@ function toggleLog(){
   LOG_MODE = !LOG_MODE;
   var lp=document.getElementById('logPanel');
   lp.classList.toggle('on',LOG_MODE);
-  document.getElementById('logBtn').textContent = LOG_MODE ? '📋 日志开' : '📋 日志关';
+  const chk=document.getElementById('logChk');
+  if(chk)chk.textContent = LOG_MODE ? '✓' : '';
 }
 function dlog(msg){
   var ts=new Date().toLocaleTimeString('en-US',{hour12:false})+'.'+String(Date.now()%1000).padStart(3,'0');
@@ -3286,7 +3706,8 @@ function dlog(msg){
 }
 function toggleDebug(){
   DEBUG_MODE = !DEBUG_MODE;
-  document.getElementById('debugBtn').textContent = DEBUG_MODE ? '🔍 调试开' : '🔍 调试关';
+  const chk=document.getElementById('debugChk');
+  if(chk)chk.textContent = DEBUG_MODE ? '✓' : '';
   document.getElementById('pvCanvas').style.display = DEBUG_MODE ? 'block' : 'none';
   if(DEBUG_MODE && PV.img) drawDebug();
 }
@@ -3401,9 +3822,15 @@ function updDelBtn(){
     const btn=document.getElementById('delBtn');
     btn.disabled=(total===0);
     btn.textContent=total>0?'删除 '+total+' 个':'删除 (0)';
-    let hasARW=false;
-    for(let g of GROUPS)for(let p of g){if(p.keep && p.has_raw){hasARW=true;break}}
-    document.getElementById('exportBtn').disabled=!hasARW;
+    let arwCount=0;
+    for(let g of GROUPS)for(let p of g){if(p.keep && p.has_raw)arwCount++}
+    const expBtn=document.getElementById('exportBtn');
+    expBtn.disabled=(arwCount===0);
+    expBtn.textContent=arwCount>0?`导出ARW · ${arwCount}`:'导出ARW';
+    const expMi=document.getElementById('exportMi');
+    if(expMi)expMi.disabled=(arwCount===0);
+    const expMiCnt=document.getElementById('exportMiCnt');
+    if(expMiCnt)expMiCnt.textContent=arwCount>0?String(arwCount):'';
     let parts=[];
     if(counts.JPG)parts.push('JPG '+counts.JPG);
     if(counts.HIF)parts.push('HIF '+counts.HIF);
@@ -3491,6 +3918,39 @@ async function hotReload(e){
   }
 }
 
+// ── 菜单栏交互 ──────────────────────────
+function toggleMenu(titleEl){
+  const menu=titleEl.closest('.menu');
+  const wasOpen=menu.classList.contains('open');
+  closeMenus();
+  if(!wasOpen)menu.classList.add('open');
+}
+function closeMenus(){document.querySelectorAll('.menu.open').forEach(m=>m.classList.remove('open'))}
+document.addEventListener('click',function(e){
+  const menu=e.target.closest('.menu');
+  if(menu && e.target.closest('.mi')){
+    menu.classList.remove('open');   // 点击菜单项后收起
+  }else if(!menu){
+    closeMenus();                    // 点击菜单外收起
+  }
+});
+document.addEventListener('keydown',function(e){
+  if((e.ctrlKey||e.metaKey)&&(e.key==='o'||e.key==='O')){e.preventDefault();focusDir()}
+  if(e.key==='Escape')closeMenus();
+});
+function focusDir(){
+  const inp=document.getElementById('dirInput');
+  if(inp){inp.focus();inp.select()}
+}
+function aboutInfo(){
+  const md=document.getElementById('md'),mb=document.getElementById('mb');
+  md.classList.add('on');
+  mb.innerHTML=`<h2>📷 连拍挑选</h2>
+    <p style="font-size:13px">轻量级连拍照片挑选工具。</p>
+    <p style="font-size:12px;color:#888">· 左键照片切换保留（绿框）<br>· 右键照片打开大图预览<br>· 顶部菜单栏分类管理 评分/筛选/标注 等设置<br>· 工具栏切换删除范围，执行删除 / 导出 ARW</p>
+    <div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove('on')">关闭</button></div>`
+}
+
 load()
 </script>
 </body>
@@ -3529,7 +3989,11 @@ def main():
     url = f'http://{host}:{port}'
 
     print(f"=> 服务器已启动: {url}")
-    print(f"=> 在浏览器中打开，在顶部目录栏输入路径开始使用")
+    if not _load_roots():
+        print("=> 首次启动：浏览器中会引导添加相册根目录（如 D:/0_camera）")
+        print("   已配置的相册根保存在 ~/.tgphoto/roots.json，可随时在界面中修改")
+    else:
+        print("=> 在浏览器中打开，首页默认显示全部相册；顶部可输入路径扫描单个目录")
     print(f"   按 Ctrl+C 停止服务\n")
 
     try:
