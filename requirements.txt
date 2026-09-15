@@ -6,3 +6,6 @@ mediapipe>=0.10
 numpy>=1.24
 pillow>=10.0
 onnxruntime>=1.15
+# GPU 加速（可选，需 N 卡 + CUDA 运行时）：替换上面的 onnxruntime 为
+# pip install onnxruntime-gpu==1.xx（版本需匹配 Python 与 CUDA；见 README）
+# insightface（人物识别 buffalo_s 模型；缺失时自动降级无人物识别）

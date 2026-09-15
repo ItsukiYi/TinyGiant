@@ -52,6 +52,32 @@ def test_scan_groups_by_time(tmp_path):
     assert groups[-1][0].num == 4
 
 
+def test_jpeg_exif_dt_fast(tmp_path):
+    """快速 EXIF 解析器应能从 Pillow 生成的 JPG 中读出 DateTimeOriginal(36867)。"""
+    _make_jpg(tmp_path / 'DSC0001.jpg', '2024:01:01 10:30:45')
+    dt = P._jpeg_exif_dt_fast(tmp_path / 'DSC0001.jpg')
+    assert dt is not None
+    assert dt.strftime('%Y:%m:%d %H:%M:%S') == '2024:01:01 10:30:45'
+
+
+def test_dates_cache_skips_exif_reparse(tmp_path, monkeypatch):
+    """dates.json 命中后二次扫描不应重复解析 EXIF（打开相册提速的关键）。"""
+    _make_jpg(tmp_path / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    _make_jpg(tmp_path / 'DSC0002.jpg', '2024:01:01 10:00:05')
+    calls = {'n': 0}
+    orig = P._get_dt
+    def counting(path):
+        calls['n'] += 1
+        return orig(path)
+    monkeypatch.setattr(P, '_get_dt', counting)
+    P.scan(str(tmp_path), start_workers=False)
+    first = calls['n']
+    assert first >= 2  # 首扫无缓存，逐张解析
+    assert (tmp_path / '_tg_cache' / 'dates.json').exists()
+    P.scan(str(tmp_path), start_workers=False)
+    assert calls['n'] == first  # 二次扫描全部命中缓存，零新增解析
+
+
 def test_scan_skips_cache_and_trash_dirs(tmp_path):
     _make_jpg(tmp_path / 'DSC0001.jpg', '2024:01:01 10:00:00')
     # 这些目录应被扫描跳过
@@ -185,6 +211,73 @@ def test_read_cache_bytes_hit_and_miss(tmp_path):
     assert P._read_cache_bytes(str(tmp_path), p, 250) == b'thumbdata'
     # 1600 缓存未生成 → None
     assert P._read_cache_bytes(str(tmp_path), p, 1600) is None
+
+
+def test_preview_full_cache_roundtrip_and_invalidation(tmp_path):
+    """全分辨率预览缓存：未生成→None；写入后命中；源文件变化(签名失效)后重取。"""
+    src = tmp_path / 'a.jpg'
+    src.write_bytes(b'xx')
+    p = P.Photo(src)
+    data = b'\xff\xd8\xff\xe0full-preview-data'
+    assert P._read_preview_full(tmp_path, p) is None
+    P._write_preview_full(tmp_path, p, data)
+    assert P._read_preview_full(tmp_path, p) == data
+    # 源文件签名变化（size 不同）→ 缓存失效
+    src.write_bytes(b'yyyy')
+    assert P._read_preview_full(tmp_path, p) is None
+
+
+def _fake_handler(captured):
+    class H(P.Handler):
+        def __init__(self): pass
+        def _json(self, data, status=200): captured.update(data)
+    return H()
+
+
+def _setup_export_photo(tmp_path, monkeypatch):
+    src = tmp_path / 'a.jpg'
+    src.write_bytes(b'jpeg')
+    p = P.Photo(src)
+    p.keep = True
+    p.raw = tmp_path / 'a.ARW'
+    p.raw.write_bytes(b'rawbytes')
+    monkeypatch.setattr(P, 'groups', [[p]])
+    monkeypatch.setattr(P, 'photo_list', [p])
+    monkeypatch.setattr(P, 'current_dir', str(tmp_path))
+    monkeypatch.setattr(P, 'scan_root', str(tmp_path))
+    return p
+
+
+def test_api_export_preview_returns_ok(tmp_path, monkeypatch):
+    """导出预览应返回 ok:True（前端依赖 !d.ok 判断，缺 ok 会显示 undefined）。"""
+    p = _setup_export_photo(tmp_path, monkeypatch)
+    captured = {}
+    _fake_handler(captured).api_export({'confirmed': False})
+    assert captured.get('ok') is True
+    assert captured.get('count') == 1
+    assert captured.get('files') == ['a.ARW']
+
+
+def test_api_export_confirm_returns_ok_and_preserves_keep(tmp_path, monkeypatch):
+    """确认导出应返回 ok:True、复制 ARW，且不清空用户的选择(keep)。"""
+    p = _setup_export_photo(tmp_path, monkeypatch)
+    captured = {}
+    _fake_handler(captured).api_export({'confirmed': True})
+    assert captured.get('ok') is True
+    assert captured.get('done') is True
+    assert captured.get('count') == 1
+    assert p.keep is True  # 选择信息不消失
+    export_dir = list(tmp_path.glob('挑选_*'))
+    assert len(export_dir) == 1
+    assert (export_dir[0] / 'a.ARW').read_bytes() == b'rawbytes'
+
+
+def test_serve_image_jpg_returns_original(tmp_path):
+    """JPG 高清预览应直接返回原文件字节（原图级清晰度）。"""
+    src = tmp_path / 'a.jpg'
+    raw = b'\xff\xd8\xff\xe0original-jpeg-bytes'
+    src.write_bytes(raw)
+    assert P.serve_image(src) == raw
 
 
 # ═══════════════════════════════════════════════════════════
@@ -749,6 +842,108 @@ def test_merge_suggestions(tmp_path, monkeypatch):
     pairs = [(s['src_id'], s['dst_id']) for s in suggestions]
     assert (2, 1) in pairs or (1, 2) in pairs  # src=2(小) → dst=1(大)
     assert not any(3 in pair for pair in pairs)
+
+
+def test_migrate_persons_v4(tmp_path, monkeypatch):
+    """v3 → v4：单质心升级为多示例 embeddings=[prototype]。"""
+    fake = tmp_path / 'v4'; fake.mkdir()
+    monkeypatch.setattr(Path, 'home', lambda: fake)
+    P._save_persons({'version': 3, 'persons': {
+        '1': {'name': '花崎', 'confirmed': True, 'prototype': [0.1, 0.2], 'count': 5, 'created_at': 0},
+    }, 'next_id': 2})
+    P._PERSONS_MEM = None  # 清内存缓存强制从磁盘重载 → 触发迁移
+    db = P._load_persons()
+    assert db['version'] == 4
+    assert db['persons']['1']['embeddings'] == [[0.1, 0.2]]
+    assert db['persons']['1']['prototype'] == [0.1, 0.2]
+
+
+def test_person_sim_multi_exemplar():
+    """多示例匹配：取最大余弦（对姿势/光照变化比单质心更稳健）。"""
+    import numpy as np
+    a = np.zeros(512, dtype=np.float32); a[0] = 1.0
+    b = np.zeros(512, dtype=np.float32); b[1] = 1.0
+    pdata = {'embeddings': [a.tolist(), b.tolist()], 'prototype': [0.5, 0.5]}
+    assert P._person_sim(b, pdata) > 0.99  # 与 b 示例同方向 → 命中
+    # 单质心会把 a/b 折中；多示例对 b 方向更贴近（max 示例相似度 > 质心相似度）
+    centroid = np.zeros(512, dtype=np.float32); centroid[:2] = [0.5, 0.5]
+    centroid /= np.linalg.norm(centroid)
+    assert P._person_sim(b, pdata) > P._cosine_sim(b, centroid)
+
+
+def test_match_unconfirmed_when_included(tmp_path, monkeypatch):
+    """include_unconfirmed=True 时能匹配未确认人物（待确认跨文件夹去重用）。"""
+    import numpy as np
+    fake = tmp_path / 'un2'; fake.mkdir()
+    monkeypatch.setattr(Path, 'home', lambda: fake)
+    P._save_persons({'version': 4, 'persons': {}, 'next_id': 1})
+    emb = np.ones(512, dtype=np.float32) / np.linalg.norm(np.ones(512))
+    pid = P._register_person(emb, confirmed=False)
+    p, sim, n = P._match_person(emb, threshold=0.5, include_unconfirmed=True)
+    assert p == pid and n == 1
+    p2, _, n2 = P._match_person(emb, threshold=0.5)  # 默认不匹配未确认
+    assert p2 is None and n2 == 0
+
+
+def test_faces_persistence_roundtrip(tmp_path):
+    """faces.json 写入后可恢复（box/lm/embedding 保真）。"""
+    d = tmp_path / 'fp'; d.mkdir()
+    faces = {'D:/x/DSC0001.jpg': {'sig': '100|200', 'faces': [
+        {'box': [0.1, 0.2, 0.3, 0.4], 'lm': [[0.0, 0.0], [1.0, 1.0]],
+         'ear': 0.25, 'area': 0.05, 'blink_l': 0.1, 'blink_r': 0.1,
+         'embedding': [0.5, 0.5], 'det_score': 0.9},
+    ]}}
+    P._save_faces(d, faces)
+    loaded = P._load_faces(d)
+    assert 'D:/x/DSC0001.jpg' in loaded
+    f = P._face_from_json(loaded['D:/x/DSC0001.jpg']['faces'][0])
+    assert f['box'] == (0.1, 0.2, 0.3, 0.4)
+    assert f['embedding'] == [0.5, 0.5]
+    assert f['lm'][0] == (0.0, 0.0)
+
+
+def test_face_quality_filter(tmp_path):
+    """低置信/极小脸不进聚类（det_score/area 过滤）。"""
+    import numpy as np
+    d = tmp_path / 'fq'; d.mkdir()
+    p = P.Photo(d / 'DSC0001.jpg')
+    def face(det, area):
+        return {'box': (0, 0, 1, 1), 'lm': [], 'ear': 0.25, 'area': area,
+                'blink_l': 0.1, 'blink_r': 0.1, 'det_score': det, 'embedding': np.ones(512)}
+    p._face_data = [face(0.05, 0.3), face(0.9, 0.001), face(0.9, 0.1)]
+    rows = P._extract_all_faces(str(d), [p])
+    assert len(rows) == 1
+    assert rows[0][1]['area'] == 0.1
+
+
+def test_gpu_providers_detection_safe():
+    """GPU 检测返回合法结果且不崩溃：cuDNN 运行库不可用时安全回退 CPU。"""
+    providers, ctx = P._gpu_providers()
+    assert isinstance(providers, list) and len(providers) >= 1
+    assert ctx in (-1, 0)
+    assert 'CPUExecutionProvider' in providers
+    # 再次调用应命中缓存（不重复探测）
+    providers2, _ = P._gpu_providers()
+    assert providers2 == providers
+
+
+def test_faces_cache_empty_list_skips_redetect(tmp_path, monkeypatch):
+    """无脸照片的空缓存是有效缓存：二次提取不重复检测。"""
+    d = tmp_path / 'ef'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    p = P.Photo(d / 'DSC0001.jpg')
+    calls = {'n': 0}
+    orig = P._detect_faces
+    def counting(*a, **k):
+        calls['n'] += 1
+        return []
+    monkeypatch.setattr(P, '_detect_faces', counting)
+    p._face_data = []
+    P._extract_all_faces(str(d), [p])   # 第一次：检测(空)并缓存空列表
+    assert calls['n'] == 1
+    p._face_data = []                    # 模拟新会话（_face_data 丢失）
+    P._extract_all_faces(str(d), [p])    # 第二次：命中空缓存，不再检测
+    assert calls['n'] == 1
 
 
 def test_merge_pending_persists(tmp_path):

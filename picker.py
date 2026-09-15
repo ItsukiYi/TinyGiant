@@ -91,6 +91,11 @@ class Photo:
 
 def _get_dt(path: Path) -> datetime | None:
     try:
+        # JPG：走快速解析器（只读文件头，比 PIL 全量 EXIF 快约 20 倍）
+        if path.suffix.upper() in ('.JPG', '.JPEG'):
+            dt = _jpeg_exif_dt_fast(path)
+            if dt:
+                return dt
         img = Image.open(path)
         exif = None
         try:
@@ -104,6 +109,113 @@ def _get_dt(path: Path) -> datetime | None:
     except Exception:
         pass
     return None
+
+def _jpeg_exif_dt_fast(path: Path) -> datetime | None:
+    """快速解析 JPEG 的 EXIF 拍摄时间：手工遍历 IFD 只取日期标签。
+    实测约 0.3ms/张（PIL 的 _getexif 约 7ms/张）。解析失败返回 None，由 _get_dt 回退 PIL。"""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(65536)
+        if data[:2] != b'\xff\xd8':
+            return None
+        i = 2
+        n = len(data)
+        while i + 4 <= n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD9:
+                i += 2
+                continue
+            seg_len = int.from_bytes(data[i + 2:i + 4], 'big')
+            if seg_len < 2 or i + 4 + seg_len > n:
+                break
+            if marker == 0xE1 and data[i + 4:i + 10] == b'Exif\x00\x00':
+                return _exif_ifd_dt(data, i + 10)
+            i += 2 + seg_len
+    except Exception:
+        pass
+    return None
+
+def _exif_ifd_dt(data: bytes, off: int) -> datetime | None:
+    """在 TIFF 数据中找拍摄时间：优先 ExifIFD 的 DateTimeOriginal(36867)，
+    其次 IFD0 的 DateTime(306)。返回 None 表示没有/解析失败。"""
+    try:
+        if off + 8 > len(data):
+            return None
+        bo = data[off:off + 2]
+        if bo == b'II':
+            e = 'little'
+        elif bo == b'MM':
+            e = 'big'
+        else:
+            return None
+        if int.from_bytes(data[off + 2:off + 4], e) != 42:
+            return None
+        ifd0 = int.from_bytes(data[off + 4:off + 8], e)
+
+        def _read_ifd(ptr):
+            entries = {}
+            exptr = None
+            p = off + ptr
+            if p + 2 > len(data):
+                return entries, exptr
+            count = int.from_bytes(data[p:p + 2], e)
+            p += 2
+            for _ in range(count):
+                if p + 12 > len(data):
+                    break
+                tag = int.from_bytes(data[p:p + 2], e)
+                typ = int.from_bytes(data[p + 2:p + 4], e)
+                val_cnt = int.from_bytes(data[p + 4:p + 8], e)
+                val_off = p + 8
+                if tag == 0x8769:  # ExifIFD 指针
+                    exptr = int.from_bytes(data[val_off:val_off + 4], e)
+                else:
+                    entries[tag] = (typ, val_cnt, val_off)
+                p += 12
+            return entries, exptr
+
+        entries, exptr = _read_ifd(ifd0)
+        # IFD0 可能直接含 DateTimeOriginal(36867，Pillow 生成的 EXIF 即如此) 或 DateTime(306)
+        if 36867 in entries:
+            dt = _exif_ascii_dt(data, off, entries[36867], e)
+            if dt:
+                return dt
+        if 306 in entries:
+            dt = _exif_ascii_dt(data, off, entries[306], e)
+            if dt:
+                return dt
+        # 标准相机布局：DateTimeOriginal 在 0x8769 ExifIFD 子目录
+        if exptr is not None:
+            e2, _ = _read_ifd(exptr)
+            if 36867 in e2:
+                dt = _exif_ascii_dt(data, off, e2[36867], e)
+                if dt:
+                    return dt
+            if 306 in e2:
+                dt = _exif_ascii_dt(data, off, e2[306], e)
+                if dt:
+                    return dt
+    except Exception:
+        return None
+    return None
+
+def _exif_ascii_dt(data: bytes, tiff_off: int, entry, e) -> datetime | None:
+    typ, val_cnt, val_off = entry
+    if typ != 2:  # 非 ASCII 字符串
+        return None
+    if val_cnt <= 4:
+        raw = data[val_off:val_off + val_cnt]
+    else:
+        ptr = tiff_off + int.from_bytes(data[val_off:val_off + 4], e)
+        raw = data[ptr:ptr + val_cnt]
+    s = raw.split(b'\x00')[0].decode('ascii', 'ignore').strip()
+    try:
+        return datetime.strptime(s, '%Y:%m:%d %H:%M:%S')
+    except Exception:
+        return None
 
 def _best_dt(photo: Photo) -> datetime | None:
     dt = _get_dt(photo.preview)
@@ -242,7 +354,7 @@ _R_EYE_106 = [89, 90, 91, 92, 93, 94]   # 右眼外→上→内→下
 
 def _detect_faces(rgb_small) -> list:
     """用 InsightFace buffalo_s 检测人脸，返回 [{box, lm, ear, area, blink, blink_l, blink_r, embedding}]。
-    box/lm 为归一化坐标。insightface 缺失返回 []。"""
+    box/lm 为归一化坐标。insightface 缺失返回 []。GPU 运行期失败自动回退 CPU 重试。"""
     try:
         import cv2, numpy as np
         app = _get_face_app()
@@ -250,8 +362,20 @@ def _detect_faces(rgb_small) -> list:
             return []
         h, w = rgb_small.shape[:2]
         bgr = cv2.cvtColor(rgb_small, cv2.COLOR_RGB2BGR)
-        with _mp_lock:
-            faces = app.get(bgr)
+        try:
+            with _mp_lock:
+                faces = app.get(bgr)
+        except Exception:
+            # GPU 运行期崩溃（驱动/显存不足等）→ 回退 CPU 重试一次
+            if _gpu_providers()[1] == 0:
+                print("  >> GPU 推理失败，人脸检测回退 CPU")
+                app = _force_cpu_face_app()
+                if app is None:
+                    return []
+                with _mp_lock:
+                    faces = app.get(bgr)
+            else:
+                raise
         out = []
         for face in faces:
             x1, y1, x2, y2 = face.bbox
@@ -750,14 +874,36 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     if not photos:
         return []
 
-    for p in photos:
-        p._dt = _best_dt(p)
-
     # 还原持久化状态（keep/star/score）
     _restore_state(photos, load_state(str(root)))
     # 检测历史导出目录，把仍在原相册中的已导出 ARW 对应照片默认选中（提醒已导出过）
     _mark_previously_exported(root, photos)
 
+    # 拍摄时间：优先命中持久化日期缓存（dates.json），未命中才解析 EXIF（JPG 走快速解析器）。
+    # 二次打开同一相册时基本免解析，速度接近瞬时。
+    dates = _load_dates(root)
+    dates_dirty = False
+    for p in photos:
+        sig = ''
+        try:
+            st = p.preview.stat()
+            sig = f'{st.st_mtime:.0f}|{st.st_size}'
+        except OSError:
+            pass
+        rec = dates.get(str(p.preview)) if sig else None
+        if rec and rec.get('sig') == sig and rec.get('dt'):
+            try:
+                p._dt = datetime.fromisoformat(rec['dt'])
+            except (ValueError, TypeError):
+                p._dt = None
+        else:
+            p._dt = _best_dt(p)
+            dates[str(p.preview)] = {'sig': sig, 'dt': p._dt.isoformat() if p._dt else None}
+            dates_dirty = True
+    if dates_dirty:
+        _save_dates(root, dates)
+
+    # 分组（EXIF 时间权威：编号跳跃或间隔 >30s 拆组）
     groups = [[photos[0]]]
     for i in range(1, len(photos)):
         prev, cur = photos[i-1], photos[i]
@@ -798,7 +944,7 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
 #  图片服务 + 缓存
 # ═══════════════════════════════════════════════════════════
 
-def make_thumb(path: Path, size: int = THUMB_W) -> bytes | None:
+def make_thumb(path: Path, size: int = THUMB_W, quality: int = 85) -> bytes | None:
     try:
         img = Image.open(path)
         # 用 draft 快速解码到目标尺寸附近，避免解码全分辨率
@@ -811,7 +957,7 @@ def make_thumb(path: Path, size: int = THUMB_W) -> bytes | None:
         if w > size:
             img = img.resize((size, int(h * size / w)), Image.BILINEAR)
         buf = io.BytesIO()
-        img.save(buf, 'JPEG', quality=85)
+        img.save(buf, 'JPEG', quality=quality)
         return buf.getvalue()
     except Exception as e:
         print(f"  !! 图片处理失败: {path.name} -- {e}")
@@ -826,11 +972,140 @@ def serve_image(path: Path) -> bytes | None:
             print(f"  !! 读取失败: {path.name} -- {e}")
             return None
     elif ext in ('.HIF', '.HEIC'):
-        return make_thumb(path, size=2400)
+        # 高清预览：按原分辨率解码（浏览器不原生支持 HEIF，需转 JPEG）；
+        # size 取极大值使 make_thumb 不做下采样，保留原图像素，放大才不糊。
+        # 首次生成较慢（全分辨率解码），浏览器端命中缓存后仍秒开。
+        return make_thumb(path, size=65535, quality=92)
     return None
 
 def _cache_dir(root: Path) -> Path:
     return root / '_tg_cache'
+
+# ── 全分辨率预览缓存（HIF）──────────────────────────────
+# 浏览器不原生支持 HEIF，需转 JPEG 才能预览；全分辨率转换较慢（1-3s/张）。
+# 用签名 sidecar 校验源文件未变则直接复用，避免每次打开都重新解码。
+def _preview_full_path(root: Path, photo) -> Path:
+    return _cache_dir(root) / f'preview_full_{photo.id}.jpg'
+
+def _read_preview_full(root: Path, photo) -> bytes | None:
+    cf = _preview_full_path(root, photo)
+    if not cf.exists():
+        return None
+    try:
+        st = photo.preview.stat()
+        sig = f'{st.st_mtime:.0f}|{st.st_size}'
+    except OSError:
+        return None
+    try:
+        if cf.with_suffix('.sig').read_text().strip() == sig:
+            return cf.read_bytes()
+    except Exception:
+        pass
+    return None
+
+def _write_preview_full(root: Path, photo, data: bytes) -> None:
+    cf = _preview_full_path(root, photo)
+    try:
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cf.with_suffix('.jpg.tmp')
+        tmp.write_bytes(data)
+        os.replace(tmp, cf)
+        try:
+            st = photo.preview.stat()
+            sig = f'{st.st_mtime:.0f}|{st.st_size}'
+        except OSError:
+            sig = ''
+        ts = cf.with_suffix('.sig.tmp')
+        ts.write_text(sig)
+        os.replace(ts, cf.with_suffix('.sig'))
+    except Exception:
+        pass
+
+# ── 拍摄时间持久化缓存 ──────────────────────────────────
+# 打开相册时对每张照片读 EXIF 是主要耗时（PIL 约 7ms/张）。
+# 用 dates.json 按 (mtime, size) 缓存解析结果，未变化的文件直接复用，
+# 二次打开同一相册时免解析 EXIF，速度接近瞬时。
+def _dates_path(root: Path) -> Path:
+    return _cache_dir(root) / 'dates.json'
+
+def _load_dates(root: Path) -> dict:
+    try:
+        p = _dates_path(root)
+        if p.exists():
+            return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return {}
+
+def _save_dates(root: Path, dates: dict) -> None:
+    try:
+        p = _dates_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(dates, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+# ── 人脸检测结果持久化 ──────────────────────────────────
+# 评分/聚类共用同一批人脸检测；结果按 (mtime, size) 缓存到 faces.json，
+# 二次评分时免重新解码图片 + 免重新跑 InsightFace，直接恢复 _face_data。
+def _faces_path(root: Path) -> Path:
+    return _cache_dir(root) / 'faces.json'
+
+def _load_faces(root: Path) -> dict:
+    try:
+        p = _faces_path(root)
+        if p.exists():
+            d = json.loads(p.read_text(encoding='utf-8'))
+            if isinstance(d, dict) and isinstance(d.get('faces'), dict):
+                return d['faces']
+    except Exception:
+        pass
+    return {}
+
+def _save_faces(root: Path, faces: dict) -> None:
+    try:
+        p = _faces_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps({'version': 1, 'faces': faces}, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+def _photo_sig(path: Path) -> str:
+    try:
+        st = path.stat()
+        return f'{st.st_mtime:.0f}|{st.st_size}'
+    except OSError:
+        return ''
+
+def _face_to_json(f) -> dict:
+    lm = f.get('lm') or []
+    return {
+        'box': [float(v) for v in (f.get('box') or (0, 0, 0, 0))],
+        'lm': [[float(x), float(y)] for x, y in lm] if lm else [],
+        'ear': float(f['ear']) if f.get('ear') is not None else 0.25,
+        'area': float(f.get('area', 0.0)),
+        'blink_l': float(f['blink_l']) if f.get('blink_l') is not None else 0.25,
+        'blink_r': float(f['blink_r']) if f.get('blink_r') is not None else 0.25,
+        'embedding': [float(v) for v in (f.get('embedding') or [])],
+        'det_score': float(f.get('det_score', 0.5)),
+    }
+
+def _face_from_json(d) -> dict:
+    return {
+        'box': tuple(d.get('box', (0, 0, 0, 0))),
+        'lm': [tuple(pt) for pt in (d.get('lm') or [])],
+        'ear': d.get('ear', 0.25),
+        'area': d.get('area', 0.0),
+        'blink': None,
+        'blink_l': d.get('blink_l'),
+        'blink_r': d.get('blink_r'),
+        'embedding': d.get('embedding'),
+        'det_score': d.get('det_score', 0.5),
+    }
 
 def _cache_path(root: Path, photo: Photo, size: int) -> Path:
     name = f'thumb_{photo.id}.jpg' if size <= 500 else f'preview_{photo.id}.jpg'
@@ -847,11 +1122,11 @@ def pregenerate_cache(root: str, photos: list):
         tp = _cache_path(root_p, p, 250)
         if not tp.exists():
             d = make_thumb(p.preview, 250)
-            if d: tp.write_bytes(d); count += 1
+            if d: _write_cache_bytes(root_p, p, 250, d); count += 1
         pp = _cache_path(root_p, p, 1600)
         if not pp.exists():
             d = make_thumb(p.preview, 1600)
-            if d: pp.write_bytes(d); count += 1
+            if d: _write_cache_bytes(root_p, p, 1600, d); count += 1
         if (p.id + 1) % 100 == 0:
             print(f"  cache {p.id+1}/{len(photos)}...", end='', flush=True)
     el = _t.time() - t0
@@ -1051,6 +1326,40 @@ def _read_cache_bytes(root, photo, size) -> bytes | None:
             return None
     return None
 
+def _write_cache_bytes(root, photo, size, data: bytes) -> None:
+    """把生成的缩略图原子写入 _tg_cache，下次请求直接读，避免重复解码。"""
+    try:
+        cf = _cache_path(Path(str(root)), photo, size)
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cf.with_suffix('.jpg.tmp')
+        tmp.write_bytes(data)
+        os.replace(tmp, cf)
+    except Exception:
+        pass
+
+def _cover_cache_path(path: Path) -> Path:
+    """封面等无 id 缩略图：按绝对路径哈希缓存到所属相册的 _tg_cache。"""
+    import hashlib
+    h = hashlib.md5(str(path.resolve()).encode('utf-8')).hexdigest()[:16]
+    return path.parent / '_tg_cache' / f'cov_{h}.jpg'
+
+def _read_cover_cache(path: Path) -> bytes | None:
+    try:
+        cf = _cover_cache_path(path)
+        return cf.read_bytes() if cf.exists() else None
+    except Exception:
+        return None
+
+def _write_cover_cache(path: Path, data: bytes) -> None:
+    try:
+        cf = _cover_cache_path(path)
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cf.with_suffix('.jpg.tmp')
+        tmp.write_bytes(data)
+        os.replace(tmp, cf)
+    except Exception:
+        pass
+
 # ═══════════════════════════════════════════════════════════
 #  HTTP 服务器
 # ═══════════════════════════════════════════════════════════
@@ -1107,19 +1416,185 @@ def _get_pose_landmarker():
 
 # ── 人物识别：InsightFace buffalo_s 嵌入 + 跨目录全局持久化 ───────────────
 _face_app = None  # insightFace FaceAnalysis 单例
+_GPU_PROVIDERS: tuple | None = None  # 缓存 (providers, ctx_id)
+
+_NVIDIA_DLL_DIRS: list | None = None
+_CUDNN_BIN: str | None = None  # 真实 cuDNN bin 目录（probe 通过的那个）
+
+def _find_cudnn_candidates() -> list:
+    """按优先级收集 cuDNN bin 目录候选：NVIDIA 官方安装目录优先（可能是真库），
+    其次 pip nvidia 包目录。逐个在子进程里真实验证，取第一个 cudnnGetVersion 可调用的。"""
+    cands: list[str] = []
+    try:
+        import onnxruntime, os, glob
+        sp = os.path.dirname(os.path.dirname(onnxruntime.__file__))
+        # pip nvidia 包里的 cudnn（可能是 stub，作为低优先级兜底）
+        for pat in (os.path.join(sp, 'nvidia', 'cudnn', 'bin'),
+                    os.path.join(sp, 'nvidia', '**', 'bin')):
+            pat = pat.replace('\\', '/')
+            for d in glob.glob(pat, recursive=('**' in pat)):
+                if os.path.isfile(os.path.join(d, 'cudnn64_9.dll')) and d not in cands:
+                    cands.append(d)
+    except Exception:
+        pass
+    # NVIDIA 官方安装目录（优先）
+    for pat in (r'C:/Program Files/NVIDIA/CUDNN/*/bin/*/x64',
+                r'C:/Program Files/NVIDIA/CUDNN/*/bin',
+                r'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*/bin'):
+        try:
+            import glob as _g
+            for d in _g.glob(pat):
+                if os.path.isfile(os.path.join(d, 'cudnn64_9.dll')) and d not in cands:
+                    cands.insert(0, d)
+        except Exception:
+            pass
+    return cands
+
+def _register_cuda_dirs() -> list:
+    """把 CUDA 运行时目录注册进 DLL 搜索路径（os.add_dll_directory）：
+    pip nvidia 包 bin 目录（cublas/cudart/nvrtc） + 真实 cuDNN 目录。
+    只在首调用执行一次；失败静默。"""
+    global _NVIDIA_DLL_DIRS
+    if _NVIDIA_DLL_DIRS is not None:
+        return _NVIDIA_DLL_DIRS
+    dirs = []
+    try:
+        import onnxruntime, os, glob
+        sp = os.path.dirname(os.path.dirname(onnxruntime.__file__))
+        for pat in ('nvidia/*/bin', 'nvidia/*/bin/x86_64'):
+            for d in glob.glob(os.path.join(sp, pat)):
+                if os.path.isdir(d) and d not in dirs:
+                    try:
+                        os.add_dll_directory(d)
+                    except Exception:
+                        pass
+                    dirs.append(d)
+        # 真实 cuDNN 目录（若 probe 已定位到）
+        if _CUDNN_BIN and os.path.isdir(_CUDNN_BIN) and _CUDNN_BIN not in dirs:
+            try:
+                os.add_dll_directory(_CUDNN_BIN)
+            except Exception:
+                pass
+            dirs.append(_CUDNN_BIN)
+    except Exception:
+        pass
+    _NVIDIA_DLL_DIRS = dirs
+    return dirs
+
+def _cuda_runtime_loaded() -> bool:
+    """验证 CUDA 运行库真实可用。两层检查，都通过才启用 GPU：
+    1) onnxruntime CUDA provider DLL 能加载（缺 cublas/cudnn 直接失败）；
+    2) cuDNN 能真实调用（子进程里调 cudnnGetVersion）——cuDNN 9 的
+       cudnn64_9.dll 可能是占位 stub，provider 能加载但会话一建就 abort，
+       必须真实验证，且用子进程避免 abort 连累本进程。"""
+    global _CUDNN_BIN
+    _register_cuda_dirs()
+    try:
+        import onnxruntime, ctypes, os
+        capi = os.path.join(os.path.dirname(onnxruntime.__file__), 'capi')
+        ctypes.WinDLL(os.path.join(capi, 'onnxruntime_providers_cuda.dll'))
+    except Exception:
+        return False
+    # 2) cuDNN 真实验证（子进程，防 abort）：逐个候选目录试，取第一个可用的
+    for d in _find_cudnn_candidates():
+        if _cudnn_probe_ok(d):
+            _CUDNN_BIN = d
+            try:
+                os.add_dll_directory(d)  # onnxruntime 运行时按名加载 cudnn64_9.dll 需要它
+            except Exception:
+                pass
+            # 本进程 cwd 切到 cuDNN bin 目录：dispatcher frontend 靠 cwd 解析后端 DLL，
+            # 应用自身文件路径均为绝对路径，改 cwd 无副作用。
+            try:
+                os.chdir(d)
+            except Exception:
+                pass
+            return True
+    return False
+
+def _cudnn_probe_ok(bin_dir: str) -> bool:
+    """子进程里 chdir 到 bin_dir，加载 cudnn64_9.dll 并调 cudnnGetVersion。
+    返回码 0 且版本号非 0 才算该目录可用；stub/dispatcher 起不来时子进程内 abort，不影响本进程。"""
+    import subprocess, sys, textwrap
+    script = textwrap.dedent(r'''
+        import os, sys, ctypes
+        d = sys.argv[1]
+        try:
+            os.chdir(d)
+        except Exception:
+            pass
+        ver = -1
+        try:
+            h = ctypes.WinDLL(os.path.join(d, 'cudnn64_9.dll'))
+            ver = h.cudnnGetVersion()
+            print(ver, flush=True)
+        except BaseException:
+            sys.exit(3)
+        sys.exit(0 if ver > 0 else 2)
+    ''')
+    try:
+        r = subprocess.run([sys.executable, '-c', script, bin_dir], capture_output=True,
+                           timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if r.returncode == 0:
+            try:
+                return int(r.stdout.strip().split()[0]) > 0
+            except Exception:
+                return False
+        return False
+    except Exception:
+        return False
+
+def _gpu_providers() -> tuple:
+    """检测 onnxruntime 可用推理供应商。
+    CUDA 运行库真实可用（onnxruntime-gpu + CUDA 运行时）→ 优先 GPU；否则 CPU。"""
+    global _GPU_PROVIDERS
+    if _GPU_PROVIDERS is None:
+        try:
+            if _cuda_runtime_loaded():
+                import onnxruntime as ort
+                if 'CUDAExecutionProvider' in ort.get_available_providers():
+                    _GPU_PROVIDERS = (['CUDAExecutionProvider', 'CPUExecutionProvider'], 0)
+                    print("  >> 人脸检测/识别：使用 GPU (CUDAExecutionProvider)")
+                else:
+                    _GPU_PROVIDERS = (['CPUExecutionProvider'], -1)
+            else:
+                _GPU_PROVIDERS = (['CPUExecutionProvider'], -1)
+        except Exception:
+            _GPU_PROVIDERS = (['CPUExecutionProvider'], -1)
+    return _GPU_PROVIDERS
+
+def _force_cpu_face_app():
+    """GPU 不可用/运行期失败 → 重建 CPU 版 FaceAnalysis，并缓存结果避免反复尝试。"""
+    global _face_app, _GPU_PROVIDERS
+    _GPU_PROVIDERS = (['CPUExecutionProvider'], -1)
+    with _mp_lock:
+        _face_app = None
+        try:
+            from insightface.app import FaceAnalysis
+            _face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+            _face_app.prepare(ctx_id=-1, det_size=(640, 640))
+        except Exception:
+            _face_app = None
+    return _face_app
 
 def _get_face_app():
-    """单例加载 InsightFace buffalo_s（检测+landmark+embedding+genderage）。缺失返回 None。"""
+    """单例加载 InsightFace buffalo_s（检测+landmark+embedding+genderage）。
+    有 GPU 用 GPU（ctx_id=0），初始化失败自动回退 CPU。缺失返回 None。"""
     global _face_app
     if _face_app is None:
         with _mp_lock:
             if _face_app is None:
+                providers, ctx_id = _gpu_providers()
                 try:
                     from insightface.app import FaceAnalysis
-                    _face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
-                    _face_app.prepare(ctx_id=-1, det_size=(640, 640))
+                    _face_app = FaceAnalysis(name='buffalo_s', providers=providers)
+                    _face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
                 except Exception:
                     _face_app = None
+                if _face_app is None and 'CUDAExecutionProvider' in providers:
+                    # GPU 初始化失败 → 回退 CPU，并缓存结果避免反复尝试
+                    print("  >> GPU 初始化失败，人脸检测回退 CPU")
+                    _force_cpu_face_app()
     return _face_app
 _PERSON_PALETTE = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6',
                    '#1abc9c', '#e67e22', '#34495e', '#e91e63', '#00bcd4']
@@ -1132,7 +1607,7 @@ def _person_color(pid: int | None) -> str:
 
 
 _onnx_lock = threading.Lock()
-_persons_lock = threading.Lock()
+_persons_lock = threading.RLock()  # 可重入：_load_persons 内部也加锁（内存缓存）
 _face_recognizer = None  # onnxruntime.InferenceSession
 
 _RECOG_THRESHOLD = 0.45   # 匹配下限：≥此值才归类到已有人物（保守，避免相似不同人误合并）
@@ -1153,7 +1628,9 @@ def _get_face_recognizer():
                 _model = Path(__file__).parent / 'face_recognizer.onnx'
                 if _model.exists() and _model.stat().st_size > 100_000:
                     import onnxruntime as ort
-                    _face_recognizer = ort.InferenceSession(str(_model))
+                    # 固定 CPU：此路径非主线（实际特征来自 buffalo_s），避免触发 CUDA 加载
+                    _face_recognizer = ort.InferenceSession(
+                        str(_model), providers=['CPUExecutionProvider'])
     return _face_recognizer
 
 def _cosine_sim(a, b) -> float:
@@ -1254,28 +1731,38 @@ def _global_root() -> Path:
 def _persons_path() -> Path:
     return _global_root() / 'persons.json'
 
+_PERSONS_MEM: dict | None = None  # 内存缓存：匹配循环不再反复读盘
+
 def _load_persons() -> dict:
-    """加载全局人物库 v3。自动从旧版本迁移（v1/v2 → v3）。"""
-    p = _persons_path()
-    data = None
-    try:
-        if p.exists():
-            data = json.loads(p.read_text(encoding='utf-8'))
-    except Exception:
+    """加载全局人物库（内存缓存 + 磁盘）。自动迁移旧版本到 v4。"""
+    global _PERSONS_MEM
+    with _persons_lock:
+        if _PERSONS_MEM is not None:
+            return _PERSONS_MEM
+        p = _persons_path()
         data = None
-    # 迁移：旧位置有但新位置没有
-    if data is None:
-        old = Path.home() / '.tgphoto' / 'persons.json'
-        if old.exists() and not p.exists():
-            try:
-                data = json.loads(old.read_text(encoding='utf-8'))
-            except Exception:
-                data = None
-    if data is None or not isinstance(data, dict) or 'persons' not in data:
-        return {'version': 3, 'persons': {}, 'next_id': 1}
-    if int(data.get('version', 1)) < 3:
-        data = _migrate_persons_v3(data)
-    return data
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            data = None
+        # 迁移：旧位置有但新位置没有
+        if data is None:
+            old = Path.home() / '.tgphoto' / 'persons.json'
+            if old.exists() and not p.exists():
+                try:
+                    data = json.loads(old.read_text(encoding='utf-8'))
+                except Exception:
+                    data = None
+        if data is None or not isinstance(data, dict) or 'persons' not in data:
+            data = {'version': _PERSONS_VERSION, 'persons': {}, 'next_id': 1}
+        ver = int(data.get('version', 1))
+        if ver < 3:
+            data = _migrate_persons_v3(data)
+        if int(data.get('version', 1)) < 4:
+            data = _migrate_persons_v4(data)
+        _PERSONS_MEM = data
+        return data
 
 def _migrate_persons_v3(data: dict) -> dict:
     """v1/v2 → v3：把每人的滑动窗口 embeddings 聚成一个归一化质心 prototype；
@@ -1307,27 +1794,77 @@ def _migrate_persons_v3(data: dict) -> dict:
     return out
 
 def _save_persons(persons: dict) -> None:
-    """原子写入全局人物库 v3。"""
-    p = _persons_path()
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps(persons, ensure_ascii=False), encoding='utf-8')
-        os.replace(tmp, p)
-    except Exception:
-        pass
+    """原子写入全局人物库（v4），并同步内存缓存。"""
+    global _PERSONS_MEM
+    with _persons_lock:
+        _PERSONS_MEM = persons
+        p = _persons_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(persons, ensure_ascii=False), encoding='utf-8')
+            os.replace(tmp, p)
+        except Exception:
+            pass
 
-_PERSONS_VERSION = 3
+_PERSONS_VERSION = 4
+
+def _migrate_persons_v4(data: dict) -> dict:
+    """v3 → v4：单质心 prototype 升级为多示例 embeddings（首个示例=原质心）。
+    保留 prototype 字段（质心，供快速计算与旧读路径兼容），匹配改用示例最大余弦。"""
+    out = {'version': 4, 'persons': {}, 'next_id': int(data.get('next_id', 1))}
+    for pid, pdata in (data.get('persons') or {}).items():
+        if not isinstance(pdata, dict):
+            continue
+        p = dict(pdata)
+        proto = p.get('prototype')
+        if proto is not None:
+            p.setdefault('embeddings', [proto])
+        out['persons'][pid] = p
+        try:
+            out['next_id'] = max(out['next_id'], int(pid) + 1)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+_PERSON_MAX_EXEMPLARS = 8  # 每人保留的特征示例上限（多示例匹配，抗姿势/光照变化）
 
 def _person_proto(pdata: dict) -> list | None:
-    """取人物的质心向量。无则返回 None。"""
+    """取人物的质心向量。无 prototype 时从示例列表推导（兼容 v2/v3 旧数据）。"""
     proto = pdata.get('prototype')
-    return proto if proto else None
+    if proto:
+        return proto
+    embs = pdata.get('embeddings') or []
+    if embs:
+        import numpy as np
+        arr = np.asarray(embs, dtype=np.float32)
+        m = arr.mean(axis=0)
+        n = np.linalg.norm(m)
+        if n > 0:
+            return (m / n).astype(np.float32).tolist()
+    return None
 
-def _match_person(emb, threshold=_RECOG_THRESHOLD) -> tuple:
-    """匹配全局人物库（质心匹配）。返回 (person_id, similarity, n=1/0)。
-    只匹配 confirmed 人物（未命名的人物不参与自动跨库匹配）。
-    取与各 confirmed 人物质心的最高余弦；≥ threshold 返回。"""
+def _person_exemplars(pdata: dict) -> list:
+    """取人物的特征示例列表（v4 多示例）；无示例时回退单质心。"""
+    embs = pdata.get('embeddings')
+    if embs:
+        return embs
+    proto = pdata.get('prototype')
+    return [proto] if proto else []
+
+def _person_sim(emb, pdata) -> float:
+    """与该人物库条目的相似度：取所有示例中的最大余弦（对姿势/光照变化更稳健）。"""
+    best = 0.0
+    for ex in _person_exemplars(pdata):
+        s = _cosine_sim(emb, np.asarray(ex, dtype=np.float32))
+        if s > best:
+            best = s
+    return best
+
+def _match_person(emb, threshold=_RECOG_THRESHOLD, include_unconfirmed=False) -> tuple:
+    """匹配全局人物库（示例最大余弦）。返回 (person_id, similarity, n=1/0)。
+    include_unconfirmed=False 只匹配 confirmed（默认，跨库自动归并用）；
+    =True 也匹配未确认人物（用于待确认簇跨文件夹去重）。"""
     if emb is None:
         return None, 0.0, 0
     import numpy as np
@@ -1335,12 +1872,9 @@ def _match_person(emb, threshold=_RECOG_THRESHOLD) -> tuple:
         persons = _load_persons()
     best_id, best_sim = None, 0.0
     for pid, pdata in persons['persons'].items():
-        if not pdata.get('confirmed', False):
-            continue  # 未确认人物不参与自动匹配
-        proto = _person_proto(pdata)
-        if proto is None:
-            continue
-        sim = _cosine_sim(emb, np.asarray(proto, dtype=np.float32))
+        if not include_unconfirmed and not pdata.get('confirmed', False):
+            continue  # 未确认人物默认不参与自动匹配
+        sim = _person_sim(emb, pdata)
         if sim > best_sim:
             best_sim, best_id = sim, int(pid)
     if best_id is not None and best_sim >= threshold:
@@ -1348,7 +1882,7 @@ def _match_person(emb, threshold=_RECOG_THRESHOLD) -> tuple:
     return None, 0.0, 0
 
 def _register_person(emb, exemplar_path: str = '', name: str = '', confirmed: bool = False) -> int:
-    """新建人物 v3，存 prototype（单个向量即质心）。返回 person_id。"""
+    """新建人物 v4：存 prototype（质心）+ embeddings（示例列表）。返回 person_id。"""
     if emb is None:
         return -1
     import numpy as np
@@ -1356,12 +1890,13 @@ def _register_person(emb, exemplar_path: str = '', name: str = '', confirmed: bo
     n = np.linalg.norm(proto)
     if n > 0:
         proto = proto / n
+    proto_list = proto.astype(np.float32).tolist()
     with _persons_lock:
         persons = _load_persons()
         pid = persons['next_id']
         persons['persons'][str(pid)] = {
             'name': name, 'confirmed': confirmed,
-            'prototype': proto.tolist(), 'count': 1, 'created_at': 0}
+            'prototype': proto_list, 'embeddings': [proto_list], 'count': 1, 'created_at': 0}
         persons['next_id'] = pid + 1
         _save_persons(persons)
         return pid
@@ -1369,7 +1904,7 @@ def _register_person(emb, exemplar_path: str = '', name: str = '', confirmed: bo
 _UPDATE_MIN_SIM = 0.55  # 新 embedding 与该人物质心相似度低于此值视为 outlier，拒绝更新
 
 def _update_person(pid: int, emb, exemplar_path: str = '') -> bool:
-    """用新 embedding 更新人物质心（在线均值，count 加权）。outlier 拒绝。返回是否更新。"""
+    """用新 embedding 更新人物（在线均值质心 + 多示例列表）。outlier 拒绝。返回是否更新。"""
     if emb is None or pid is None or pid < 0:
         return False
     import numpy as np
@@ -1397,6 +1932,15 @@ def _update_person(pid: int, emb, exemplar_path: str = '') -> bool:
         if nn > 0:
             new_proto = new_proto / nn
         pdata['prototype'] = new_proto.astype(np.float32).tolist()
+        # 多示例维护：上限 _PERSON_MAX_EXEMPLARS；满时替换与新增最相似的旧示例（保持多样性）
+        e_list = e.astype(np.float32).tolist()
+        embs = pdata.get('embeddings') or []
+        if len(embs) < _PERSON_MAX_EXEMPLARS:
+            embs.append(e_list)
+        else:
+            idx = max(range(len(embs)), key=lambda j: _cosine_sim(e, np.asarray(embs[j], dtype=np.float32)))
+            embs[idx] = e_list
+        pdata['embeddings'] = embs
         pdata['count'] = cnt + 1
         _save_persons(persons)
         return True
@@ -1646,7 +2190,8 @@ def _save_roles(roles: dict) -> None:
         pass
 
 def _merge_persons(src_id: int, dst_id: int):
-    """合并 src→dst（v3 质心模型）：dst 质心 = 两质心按 count 加权平均并归一化，删除 src。"""
+    """合并 src→dst（v4 多示例模型）：dst 质心 = 两质心按 count 加权平均并归一化，
+    示例列表合并（截取上限），删除 src。"""
     import numpy as np
     with _persons_lock:
         persons = _load_persons()
@@ -1665,6 +2210,11 @@ def _merge_persons(src_id: int, dst_id: int):
                 dst['prototype'] = (merged / n).astype(np.float32).tolist()
         elif sp is not None:
             dst['prototype'] = sp
+        # 合并多示例（保持上限）
+        sembs = src.get('embeddings') or []
+        if sembs:
+            embs = (dst.get('embeddings') or []) + sembs
+            dst['embeddings'] = embs[:_PERSON_MAX_EXEMPLARS]
         dst['count'] = sc + dc
         # 命名优先保留已确认的名字
         if not dst.get('name') and src.get('name'):
@@ -1756,25 +2306,49 @@ _CLUSTER_DIST = 0.50       # HAC cosine 距离阈值（sim≥0.50 视为同一�
 _MIN_CLUSTER = 3           # 簇最小脸数（小于则视为路人，不建人物）
 _AUTO_MERGE_SIM = 0.55     # 簇质心与全局 confirmed 人物 ≥ 此值 → 自动归并
 _PENDING_SIM = 0.45        # ≥ 此值但 < AUTO → 待确认候选
+_PENDING_DEDUP_SIM = 0.52  # 未确认人物跨文件夹去重阈值（同人复用既有待确认簇，避免泛滥）
+
+_FACE_MIN_DET = 0.20    # 聚类用：脸检测置信度下限（过滤误检）
+_FACE_MIN_AREA = 0.004  # 聚类用：脸占图像面积下限（过滤背景路人/极小脸）
 
 def _extract_all_faces(root, photos) -> list:
-    """收集全部人脸 embedding（供聚类）。_face_data 为空时现场检测并回填（避免二次检测）。
-    返回 [(photo, face, emb_norm), ...]。"""
+    """收集全部人脸 embedding（供聚类）。优先命中 faces.json 缓存（免解码免检测），
+    未命中则现场检测并回填 _face_data + 落盘。返回 [(photo, face, emb_norm), ...]。"""
     import numpy as np
+    root_p = Path(root).resolve() if root else None
+    faces_map = _load_faces(root_p) if root_p else {}
+    faces_dirty = False
+    current_paths = set()
     rows = []
     for p in photos:
+        current_paths.add(str(p.preview))
         faces = getattr(p, '_face_data', None) or []
         if not faces:
-            # 现场检测并回填，供后续评分复用
-            try:
-                image = _load_score_image(root, p)
-                if image is not None:
-                    small = _resize_long(image, _FACE_LONG)
-                    faces = _detect_faces(small)
-                    p._face_data = list(faces)
-            except Exception:
-                faces = []
+            sig = _photo_sig(p.preview)
+            cached = faces_map.get(str(p.preview)) if sig else None
+            if cached and cached.get('sig') == sig and cached.get('faces') is not None:
+                # 空列表也视为有效缓存（该照片确无人脸），避免每次重检
+                faces = [_face_from_json(f) for f in cached['faces']]
+                p._face_data = list(faces)
+            else:
+                # 现场检测并回填，供后续评分复用
+                try:
+                    image = _load_score_image(root_p, p)
+                    if image is not None:
+                        small = _resize_long(image, _FACE_LONG)
+                        faces = _detect_faces(small)
+                        p._face_data = list(faces)
+                        faces_map[str(p.preview)] = {
+                            'sig': sig, 'faces': [_face_to_json(f) for f in faces]}
+                        faces_dirty = True
+                except Exception:
+                    faces = []
         for face in faces:
+            # 脸质量过滤：跳过低置信/极小脸（减少路人噪音对聚类的影响）
+            if face.get('det_score', 1.0) < _FACE_MIN_DET:
+                continue
+            if face.get('area', 0.0) < _FACE_MIN_AREA:
+                continue
             e = face.get('embedding')
             if e is None:
                 continue
@@ -1783,6 +2357,9 @@ def _extract_all_faces(root, photos) -> list:
             if n > 0:
                 arr = arr / n
             rows.append((p, face, arr))
+    if faces_dirty and root_p:
+        pruned = {k: v for k, v in faces_map.items() if k in current_paths}
+        _save_faces(root_p, pruned)
     return rows
 
 def _hac_cluster(X, dist_thr=_CLUSTER_DIST) -> list:
@@ -1860,9 +2437,16 @@ def compute_persons(root, groups) -> dict:
             cluster_person[c] = new_pid; cluster_pending[c] = True
             stats['pending'] += 1
         else:
-            new_pid = _register_person(proto, confirmed=False)
-            cluster_person[c] = new_pid; cluster_pending[c] = True
-            stats['new'] += 1
+            # 无 confirmed 命中：先尝试匹配既有未确认人物（跨文件夹去重，同人复用待确认簇）
+            upid, usim, _ = _match_person(proto, threshold=_PENDING_DEDUP_SIM, include_unconfirmed=True)
+            if upid is not None:
+                _update_person(upid, proto)
+                cluster_person[c] = upid; cluster_pending[c] = True
+                stats['pending'] += 1
+            else:
+                new_pid = _register_person(proto, confirmed=False)
+                cluster_person[c] = new_pid; cluster_pending[c] = True
+                stats['new'] += 1
     # 逐照片写回 person_id（主脸=面积最大脸所属簇）；合照=一张照片内出现 ≥2 个不同已确认人物
     from collections import defaultdict
     face_owner = []  # 每行 face 的 person_id
@@ -2242,10 +2826,33 @@ class Handler(BaseHTTPRequestHandler):
             if not safe or not safe.exists():
                 return self._placeholder()
             path = safe
+            # 封面缩略图：读按路径哈希的缓存（无 id 场景，避免每次重算）
+            if size <= 500:
+                data = _read_cover_cache(path)
+                if data:
+                    return self._send_jpeg(data)
         if size <= 500:
             data = make_thumb(path, size)
+            if data:
+                # 按需落盘：下次滚动/回访直接读缓存，不再重复解码
+                try:
+                    if photo_id is not None and scan_root:
+                        _write_cache_bytes(scan_root, p, 250, data)
+                    else:
+                        _write_cover_cache(path, data)
+                except Exception:
+                    pass
         else:
-            data = serve_image(path)  # 预览图：HIF→2400px 高清，JPG→原文件
+            # 预览图：HIF→按原分辨率转 JPEG（全量，放大不糊），JPG→原文件。
+            # HIF 转换慢，走服务端缓存（签名校验源文件未变即复用）。
+            if photo_id is not None and scan_root and path.suffix.upper() in ('.HIF', '.HEIC'):
+                data = _read_preview_full(Path(scan_root), p)
+                if not data:
+                    data = serve_image(path)
+                    if data:
+                        _write_preview_full(Path(scan_root), p, data)
+            else:
+                data = serve_image(path)
         if not data:
             return self._placeholder()
         self._send_jpeg(data)
@@ -2628,7 +3235,7 @@ class Handler(BaseHTTPRequestHandler):
             # 预览：返回待导出清单 + 已存在于历史导出目录中的文件（提示增量）
             already = [n for n in names if n in _exported_arw_names(Path(current_dir))]
             return self._json({
-                'ready': True, 'dir': str(export_dir), 'count': len(names),
+                'ok': True, 'ready': True, 'dir': str(export_dir), 'count': len(names),
                 'files': names[:500], 'already': already, 'already_count': len(already),
             })
         # 执行复制：跳过目标目录内已存在的同名文件（幂等，不覆盖）
@@ -2646,7 +3253,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}（跳过 {len(skipped)} 个已存在）")
         else:
             print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}")
-        self._json({'done': True, 'dir': str(export_dir), 'count': len(copied),
+        self._json({'ok': True, 'done': True, 'dir': str(export_dir), 'count': len(copied),
                     'skipped': len(skipped), 'files': copied})
 
     def api_delete(self, body):
