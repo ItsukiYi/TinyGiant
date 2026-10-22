@@ -204,13 +204,90 @@ def test_cleanup_dirs_stays_within_root(tmp_path):
 # ═══════════════════════════════════════════════════════════
 def test_read_cache_bytes_hit_and_miss(tmp_path):
     p = P.Photo(tmp_path / 'a.jpg')
-    # 写入与 photo.id 对应的 250 缓存
-    cp = P._cache_path(tmp_path, p, 250)
-    cp.parent.mkdir(parents=True, exist_ok=True)
-    cp.write_bytes(b'thumbdata')
+    # 写入与 photo.id 对应的 250 缓存（_write_cache_bytes 会带签名 sidecar）
+    P._write_cache_bytes(str(tmp_path), p, 250, b'thumbdata')
     assert P._read_cache_bytes(str(tmp_path), p, 250) == b'thumbdata'
     # 1600 缓存未生成 → None
     assert P._read_cache_bytes(str(tmp_path), p, 1600) is None
+
+
+def test_cache_bytes_signature_invalidation(tmp_path):
+    """缓存签名失效：源文件变化/旧缓存无 sidecar 时，缓存视为无效重新生成。"""
+    src = tmp_path / 'a.jpg'
+    src.write_bytes(b'original-content-12345')
+    p = P.Photo(src)
+    # 1) 正常写读命中
+    P._write_cache_bytes(str(tmp_path), p, 250, b'thumb-v1')
+    assert P._read_cache_bytes(str(tmp_path), p, 250) == b'thumb-v1'
+    # 2) 源文件变化（size 不同）→ 缓存失效
+    src.write_bytes(b'new-content-with-different-length!!')
+    assert P._read_cache_bytes(str(tmp_path), p, 250) is None
+    # 3) 旧格式缓存（无 .sig sidecar）→ 失效，强制重新生成
+    P._write_cache_bytes(str(tmp_path), p, 250, b'thumb-v2')
+    assert P._read_cache_bytes(str(tmp_path), p, 250) == b'thumb-v2'
+    cf = P._cache_path(tmp_path, p, 250)
+    (cf.with_suffix('.sig')).unlink()  # 模拟旧版本缓存
+    assert P._read_cache_bytes(str(tmp_path), p, 250) is None
+
+
+def test_cache_id_mismatch_invalidates(tmp_path):
+    """缓存按绝对路径哈希命名：扫描顺序变化导致 id 错位时，缓存仍与照片正确绑定。"""
+    a = tmp_path / 'a.jpg'; a.write_bytes(b'A' * 20000)
+    b = tmp_path / 'b.jpg'; b.write_bytes(b'B' * 20000)
+    pa = P.Photo(a)
+    pb = P.Photo(b)
+    pb.id = pa.id  # 模拟重新扫描后 id 错位：两张照片同 id
+    # 各自路径绑定不同缓存文件 → 天然免疫 id 错位
+    assert P._cache_path(tmp_path, pa, 250) != P._cache_path(tmp_path, pb, 250)
+    P._write_cache_bytes(str(tmp_path), pa, 250, b'thumb-of-A')
+    assert P._read_cache_bytes(str(tmp_path), pa, 250) == b'thumb-of-A'
+    # b 的缓存文件不存在 → 不会误用 a 的图
+    assert P._read_cache_bytes(str(tmp_path), pb, 250) is None
+
+
+def test_cleanup_orphan_caches(tmp_path):
+    """清理孤儿缓存：删除旧 id 命名/已删除照片的缓存，保留当前照片的缓存。"""
+    a = tmp_path / 'a.jpg'; a.write_bytes(b'A' * 20000)
+    b = tmp_path / 'b.jpg'; b.write_bytes(b'B' * 20000)
+    pa = P.Photo(a)
+    pb = P.Photo(b)
+    cache = tmp_path / '_tg_cache'; cache.mkdir()
+    # 当前照片 a 的缓存（哈希命名，保留）
+    P._write_cache_bytes(str(tmp_path), pa, 250, b'thumb-A')
+    P._write_cache_bytes(str(tmp_path), pa, 1600, b'prev-A')
+    # 已删除照片 b 的缓存（哈希命名，删）
+    P._write_cache_bytes(str(tmp_path), pb, 250, b'thumb-B')
+    # 旧 id 命名缓存（数字，删）
+    (cache / 'thumb_0.jpg').write_bytes(b'old0')
+    (cache / 'preview_12.jpg').write_bytes(b'old12')
+    (cache / 'preview_full_3.jpg').write_bytes(b'oldfull')
+    # 非缓存文件（保留）
+    (cache / 'dates.json').write_text('{}')
+    n = P._cleanup_orphan_caches(tmp_path, [pa])
+    assert n == 4  # thumb-B + 3 个旧命名
+    assert (cache / P._cache_path(tmp_path, pa, 250).name).exists()
+    assert (cache / P._cache_path(tmp_path, pa, 1600).name).exists()
+    assert not (cache / P._cache_path(tmp_path, pb, 250).name).exists()
+    assert not (cache / 'thumb_0.jpg').exists()
+    assert not (cache / 'preview_12.jpg').exists()
+    assert not (cache / 'preview_full_3.jpg').exists()
+    assert (cache / 'dates.json').exists()
+    # 幂等：再跑删除 0 个
+    assert P._cleanup_orphan_caches(tmp_path, [pa]) == 0
+
+
+def test_scan_cleans_orphan_caches(tmp_path):
+    """scan 成功后自动清理旧 id 命名缓存，共享状态文件保留。"""
+    d = tmp_path / 'alb7'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    (d / '_tg_cache').mkdir()
+    (d / '_tg_cache' / 'thumb_0.jpg').write_bytes(b'old-id-cache')
+    (d / '_tg_cache' / 'preview_12.jpg').write_bytes(b'old-id-cache2')
+    P.scan(str(d), start_workers=False)
+    cache = d / '_tg_cache'
+    assert not (cache / 'thumb_0.jpg').exists()   # 旧 id 命名被清
+    assert not (cache / 'preview_12.jpg').exists()
+    assert (cache / 'dates.json').exists()        # 共享状态保留
 
 
 def test_preview_full_cache_roundtrip_and_invalidation(tmp_path):
@@ -272,12 +349,89 @@ def test_api_export_confirm_returns_ok_and_preserves_keep(tmp_path, monkeypatch)
     assert (export_dir[0] / 'a.ARW').read_bytes() == b'rawbytes'
 
 
+def test_api_export_incremental_skips_already_exported(tmp_path, monkeypatch):
+    """增量导出：已在历史挑选_目录中的 ARW 不重复复制（预览 count=0，执行不新建目录）。"""
+    p = _setup_export_photo(tmp_path, monkeypatch)
+    # 历史导出目录已含 a.ARW
+    hist = tmp_path / '挑选_20260827_000000'
+    hist.mkdir()
+    (hist / 'a.ARW').write_bytes(b'old')
+    captured = {}
+    _fake_handler(captured).api_export({'confirmed': False})
+    assert captured.get('count') == 0
+    assert captured.get('total_count') == 1
+    assert captured.get('already_count') == 1
+    captured.clear()
+    _fake_handler(captured).api_export({'confirmed': True})
+    assert captured.get('done') is True
+    assert captured.get('count') == 0
+    assert captured.get('already_count') == 1
+    # 不应新建额外的挑选_目录（只有历史那个），且历史文件未被覆盖
+    assert len(list(tmp_path.glob('挑选_*'))) == 1
+    assert (hist / 'a.ARW').read_bytes() == b'old'
+
+
+def test_api_export_incremental_only_copies_new(tmp_path, monkeypatch):
+    """增量导出：历史已导出的跳过，仅复制新增的 ARW，且追加到最新挑选目录（不新建）。"""
+    # 两张照片：a 已导出、b 新增
+    src_a = tmp_path / 'a.jpg'; src_a.write_bytes(b'jpeg')
+    src_b = tmp_path / 'b.jpg'; src_b.write_bytes(b'jpeg')
+    pa = P.Photo(src_a); pa.keep = True; pa.raw = tmp_path / 'a.ARW'; pa.raw.write_bytes(b'A')
+    pb = P.Photo(src_b); pb.keep = True; pb.raw = tmp_path / 'b.ARW'; pb.raw.write_bytes(b'B')
+    monkeypatch.setattr(P, 'groups', [[pa, pb]])
+    monkeypatch.setattr(P, 'photo_list', [pa, pb])
+    monkeypatch.setattr(P, 'current_dir', str(tmp_path))
+    monkeypatch.setattr(P, 'scan_root', str(tmp_path))
+    hist = tmp_path / '挑选_20260825_000000'; hist.mkdir()
+    (hist / 'a.ARW').write_bytes(b'A')
+    captured = {}
+    _fake_handler(captured).api_export({'confirmed': True})
+    assert captured.get('count') == 1
+    assert captured.get('files') == ['b.ARW']
+    assert captured.get('already_count') == 1
+    assert captured.get('dir') == str(hist)  # 复用最新挑选目录
+    # 仍只有历史那一个挑选_目录，b.ARW 追加进它
+    assert len(list(tmp_path.glob('挑选_*'))) == 1
+    assert (hist / 'b.ARW').read_bytes() == b'B'
+    assert (hist / 'a.ARW').read_bytes() == b'A'
+
+
+def test_api_export_reuses_latest_dir_second_time(tmp_path, monkeypatch):
+    """第二次导出不新建目录：继续复用上一次的挑选_<时间戳> 目录做增量。"""
+    p = _setup_export_photo(tmp_path, monkeypatch)  # a.ARW keep=true
+    _fake_handler({}).api_export({'confirmed': True})
+    dirs = list(tmp_path.glob('挑选_*'))
+    assert len(dirs) == 1
+    d1 = dirs[0]
+    # 再加一张 b，第二次导出应复用 d1，不新建
+    src_b = tmp_path / 'b.jpg'; src_b.write_bytes(b'jpeg')
+    pb = P.Photo(src_b); pb.keep = True; pb.raw = tmp_path / 'b.ARW'; pb.raw.write_bytes(b'B')
+    monkeypatch.setattr(P, 'groups', [[p, pb]])
+    monkeypatch.setattr(P, 'photo_list', [p, pb])
+    captured = {}
+    _fake_handler(captured).api_export({'confirmed': True})
+    assert captured.get('count') == 1
+    assert captured.get('files') == ['b.ARW']
+    assert captured.get('dir') == str(d1)
+    assert len(list(tmp_path.glob('挑选_*'))) == 1  # 仍是同一个目录
+    assert (d1 / 'b.ARW').read_bytes() == b'B'
+    assert (d1 / 'a.ARW').exists()
+
+
 def test_serve_image_jpg_returns_original(tmp_path):
     """JPG 高清预览应直接返回原文件字节（原图级清晰度）。"""
     src = tmp_path / 'a.jpg'
     raw = b'\xff\xd8\xff\xe0original-jpeg-bytes'
     src.write_bytes(raw)
     assert P.serve_image(src) == raw
+
+
+def test_make_thumb_hif_without_ffmpeg(tmp_path, monkeypatch):
+    """无 ffmpeg 时 HEIF 缩略图回退 pillow；若也解不了则返回 None（不崩溃）。"""
+    monkeypatch.setattr(P, '_find_ffmpeg', lambda: None)
+    hif = tmp_path / 'a.HIF'
+    hif.write_bytes(b'not-a-real-heif-file')
+    assert P.make_thumb(hif, 250) is None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1133,6 +1287,41 @@ def test_mark_exported_no_override_restore(tmp_path, monkeypatch):
     assert p.keep is True and count == 1
 
 
+def test_mark_exported_respects_saved_unkeep(tmp_path):
+    """已导出照片若在 state 里被用户取消过选中（keep=False），反向选中不覆盖。"""
+    d = tmp_path / 'album3'; d.mkdir()
+    (d / 'DSC0001.jpg').write_bytes(b'x')
+    (d / 'DSC0001.ARW').write_bytes(b'x')
+    export_dir = d / '挑选_20260828_120000'
+    export_dir.mkdir()
+    (export_dir / 'DSC0001.ARW').write_bytes(b'x')
+    p = P.Photo(d / 'DSC0001.jpg'); p.find_raw()
+    # 模拟已持久化：用户曾手动取消选中
+    state = {str(p.preview): {'keep': False}}
+    count = P._mark_previously_exported(d, [p], state)
+    assert p.keep is False and count == 0
+
+
+def test_scan_reverse_select_persists_and_respects_unkeep(tmp_path):
+    """scan 反向选中应落盘 state.json；用户取消后再次 scan 不再强制选中。"""
+    d = tmp_path / 'album4'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    (d / 'DSC0001.ARW').write_bytes(b'raw')
+    hist = d / '挑选_20260826_000000'; hist.mkdir()
+    (hist / 'DSC0001.ARW').write_bytes(b'raw')
+    # 首次 scan：反向选中并落盘
+    P.scan(str(d), start_workers=False)
+    st = P.load_state(str(d))
+    assert st[str((d / 'DSC0001.jpg').resolve())]['keep'] is True
+    # 用户手动取消（模拟 toggle → save_state）
+    g = P.scan(str(d), start_workers=False)
+    g[0][0].keep = False
+    P.save_state(str(d), g)
+    # 再次 scan：不覆盖用户取消
+    g2 = P.scan(str(d), start_workers=False)
+    assert g2[0][0].keep is False
+
+
 # ═══════════════════════════════════════════════════════════
 #  评分维度可配置（dims）
 # ═══════════════════════════════════════════════════════════
@@ -1263,6 +1452,112 @@ def test_build_album_index_discovers_photo_folders(tmp_path):
     assert b['persons'] == [3] and b['roles'] == [1]
 
 
+def test_archive_roundtrip(tmp_path, monkeypatch):
+    """相册状态读写往返 + 内存缓存同步 + 旧格式兼容。"""
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    P._FOLDER_STATES_MEM = None
+    assert P._load_folder_states() == {}
+    P._save_folder_states({str((tmp_path / 'a').resolve()): 'archived',
+                           str((tmp_path / 'b').resolve()): 'tidied'})
+    assert P._load_folder_states() == {str((tmp_path / 'a').resolve()): 'archived',
+                                       str((tmp_path / 'b').resolve()): 'tidied'}
+    P._FOLDER_STATES_MEM = None  # 模拟重启：从磁盘重读
+    assert P._load_folder_states() == {str((tmp_path / 'a').resolve()): 'archived',
+                                       str((tmp_path / 'b').resolve()): 'tidied'}
+    # 兼容旧格式（v1 只有 archived 列表）
+    p = _archived_path_mock = tmp_path / 'archived.json'
+    p.write_text('{"archived": ["%s"]}' % str((tmp_path / 'c').resolve()).replace('\\', '\\\\'), encoding='utf-8')
+    P._FOLDER_STATES_MEM = None
+    assert P._load_folder_states() == {str((tmp_path / 'c').resolve()): 'archived'}
+
+
+def test_build_album_index_marks_state(tmp_path, monkeypatch):
+    """相册索引 state 字段：归档/整理/无 三态。"""
+    root = _mk_album_root(tmp_path)
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    P._FOLDER_STATES_MEM = None
+    P._save_folder_states({str((root / 'album_a').resolve()): 'archived',
+                           str((root / 'album_b').resolve()): 'tidied'})
+    albums = P._build_album_index(root)
+    by_name = {a['name']: a for a in albums}
+    assert by_name['album_a']['state'] == 'archived'
+    assert by_name['album_b']['state'] == 'tidied'
+
+
+def test_api_archive_state_toggle(tmp_path, monkeypatch):
+    """api_archive 设置/清除两种状态，自动重命名文件夹，并返回带 state 的相册索引。"""
+    root = _mk_album_root(tmp_path)
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    P._FOLDER_STATES_MEM = None
+    monkeypatch.setattr(P, '_load_roots', lambda: [str(root)])
+    p = str((root / 'album_a').resolve())
+    captured = {}
+    h = _fake_handler(captured)
+    # 设整理 → 文件夹改名 album_a_tidied
+    h.api_archive({'path': p, 'state': 'tidied'})
+    assert captured['ok'] is True
+    a = next(x for x in captured['albums'] if x['name'] == 'album_a_tidied')
+    assert a['state'] == 'tidied'
+    tidied_path = str((root / 'album_a_tidied').resolve())
+    captured.clear()
+    # 设归档 → 移除 _tidied 加 _archive → album_a_archive
+    h.api_archive({'path': tidied_path, 'state': 'archived'})
+    assert captured['ok'] is True
+    a = next(x for x in captured['albums'] if x['name'] == 'album_a_archive')
+    assert a['state'] == 'archived'  # 归档覆盖整理（互斥）
+    archived_path = str((root / 'album_a_archive').resolve())
+    captured.clear()
+    # 取消 → 移除 _archive 后缀 → 恢复 album_a
+    h.api_archive({'path': archived_path, 'state': ''})
+    assert captured['ok'] is True
+    a = next(x for x in captured['albums'] if x['name'] == 'album_a')
+    assert a['state'] == ''
+
+
+def test_api_archive_archived_purges_preview_full(tmp_path, monkeypatch):
+    """设为已归档时删除该相册的 preview_full 缓存（thumb 保留）+ 自动改名 _archive。"""
+    root = _mk_album_root(tmp_path)
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    P._FOLDER_STATES_MEM = None
+    monkeypatch.setattr(P, '_load_roots', lambda: [str(root)])
+    # 制造 preview_full 缓存
+    alb = root / 'album_a'
+    cache = alb / '_tg_cache'; cache.mkdir(parents=True, exist_ok=True)
+    (cache / 'preview_full_abc123.jpg').write_bytes(b'data')
+    (cache / 'preview_full_abc123.sig').write_text('v2|x')
+    (cache / 'thumb_x.jpg').write_bytes(b'keep')
+    p = str(alb.resolve())
+    captured = {}
+    _fake_handler(captured).api_archive({'path': p, 'state': 'archived'})
+    assert captured['ok'] is True
+    # 文件夹已改名
+    new_alb = root / 'album_a_archive'
+    assert new_alb.exists() and not alb.exists()
+    cache = new_alb / '_tg_cache'
+    assert not (cache / 'preview_full_abc123.jpg').exists()   # preview_full 已删
+    assert not (cache / 'preview_full_abc123.sig').exists()
+    assert (cache / 'thumb_x.jpg').exists()                    # thumb 保留
+    # 取消归档：改名回 album_a
+    captured.clear()
+    _fake_handler(captured).api_archive({'path': str(new_alb.resolve()), 'state': ''})
+    assert captured['ok'] is True
+    assert (root / 'album_a').exists()
+
+
+def test_api_archive_tidied_rejected_on_archived_folder(tmp_path, monkeypatch):
+    """已归档（_archive 后缀）的文件夹设整理应被拒绝。"""
+    root = _mk_album_root(tmp_path)
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    P._FOLDER_STATES_MEM = None
+    monkeypatch.setattr(P, '_load_roots', lambda: [str(root)])
+    # 先把 album_a 改名成 album_a_archive（模拟已归档命名）
+    (root / 'album_a').rename(root / 'album_a_archive')
+    captured = {}
+    _fake_handler(captured).api_archive({'path': str((root / 'album_a_archive').resolve()), 'state': 'tidied'})
+    assert captured['ok'] is False  # 拒绝：须先取消归档
+    assert (root / 'album_a_archive').exists()  # 名字未变
+
+
 def test_all_albums_aggregates_roots(tmp_path, monkeypatch):
     r1 = _mk_album_root(tmp_path, 'root1')
     r2 = tmp_path / 'root2'; (r2 / 'sub_x').mkdir(parents=True)
@@ -1340,6 +1635,89 @@ def test_api_scan_configured_root_returns_albums(tmp_path, monkeypatch):
         assert d2['view'] == 'albums'
     finally:
         srv.shutdown()
+
+
+def test_scan_gen_bump_invalidates_old():
+    """扫描打断机制：递增代次后，旧代次判定为已取消（主页/新扫描让路）。"""
+    gen = P._scan_gen_take()
+    assert not P._scan_gen_stale(gen)
+    new_gen = P._scan_gen_bump()
+    assert new_gen == gen + 1
+    assert P._scan_gen_stale(gen)      # 旧扫描应提前退出
+    assert not P._scan_gen_stale(new_gen)  # 新代次仍有效
+
+
+def test_api_scan_cancelled_does_not_publish(tmp_path, monkeypatch):
+    """扫描期间用户回主页（代次递增）→ api_scan 丢弃半成品，不覆盖全局 groups。"""
+    d = tmp_path / 'alb5'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    (d / 'DSC0001.ARW').write_bytes(b'x')
+    monkeypatch.setattr(P, 'groups', [])
+    monkeypatch.setattr(P, 'photo_list', [])
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, 'current_dir', '')
+    # 模拟扫描进行中被主页请求打断：scan 运行期间代次递增（等价并发 bump）
+    def fake_scan(directory, **kw):
+        P._scan_gen_bump()  # 扫描中途用户点了主页
+        return [[P.Photo(d / 'DSC0001.jpg')]]
+    monkeypatch.setattr(P, 'scan', fake_scan)
+    captured = {}
+    _fake_handler(captured).api_scan({'directory': str(d)})
+    assert captured.get('cancelled') is True
+    assert P.groups == []  # 半成品未发布到全局
+
+
+def test_scan_os_walk_still_finds_photos(tmp_path):
+    """os.walk 收集替代 rglob 后，scan 仍能发现照片并分组（剪枝 _tg_cache 等）。"""
+    d = tmp_path / 'alb6'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    _make_jpg(d / 'DSC0002.jpg', '2024:01:01 10:00:05')
+    (d / '_tg_cache').mkdir()
+    _make_jpg(d / '_tg_cache' / 'DSC0099.jpg', '2024:01:01 10:00:09')
+    groups = P.scan(str(d), start_workers=False)
+    assert [len(g) for g in groups] == [2]
+    assert all(str(p.preview) not in str(d / '_tg_cache') for g in groups for p in g)
+
+
+def test_api_scan_waits_for_run_lock(tmp_path, monkeypatch):
+    """扫描串行化：前一个 scan 未结束时，新的 /api/scan 等待而非并发（防 Photo id 冲突）。"""
+    import threading, time
+    d = tmp_path / 'alb8'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    monkeypatch.setattr(P, 'groups', [])
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, 'current_dir', '')
+    monkeypatch.setattr(P, 'scan', lambda directory, **kw: [])
+    # 模拟"前一个扫描仍在跑"：占住串行锁
+    assert P._scan_run_lock.acquire(timeout=1)
+    result = {}
+    def run():
+        _fake_handler(result).api_scan({'directory': str(d)})
+    th = threading.Thread(target=run); th.start()
+    time.sleep(0.3)
+    assert th.is_alive()  # 阻塞等待前一个扫描结束
+    P._scan_run_lock.release()  # 前一个扫描完成
+    th.join(timeout=5)
+    assert not th.is_alive()
+    assert result.get('ok') is True  # 串行完成后正常发布
+
+
+def test_pregenerate_cache_respects_cancel(tmp_path, monkeypatch):
+    """评分/缓存生成线程被打断时立即停止（不再占 CPU）。"""
+    import time
+    d = tmp_path / 'alb9'; d.mkdir()
+    # 30 张照片；make_thumb 用 stub（返回假图），统计调用次数
+    photos = []
+    for i in range(30):
+        p = P.Photo(d / ('DSC%04d.jpg' % (i + 1)))
+        photos.append(p)
+    calls = {'n': 0}
+    monkeypatch.setattr(P, 'make_thumb', lambda path, size: (calls.__setitem__('n', calls['n'] + 1) or b'fakejpeg'))
+    # 让代次已过期（模拟用户已点主页）→ 生成线程应一张都不处理
+    gen = P._scan_gen_bump()
+    P._scan_gen_bump()  # 再 bump 一次 → gen 已 stale
+    P.pregenerate_cache(str(d), photos, gen=gen)
+    assert calls['n'] == 0  # 打断后立即停止，不生成任何缓存
 
 
 def test_api_albums_setup_add_remove_flow(tmp_path, monkeypatch):

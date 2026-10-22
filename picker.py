@@ -3,7 +3,7 @@
 tgphoto-pick — 极简连拍照片挑选工具 v2
 """
 
-import os, sys, json, re, threading, webbrowser, argparse, io, traceback, importlib
+import os, sys, json, re, threading, webbrowser, argparse, io, traceback, importlib, subprocess
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -53,6 +53,7 @@ class Photo:
         self.is_group: bool = False  # 是否为合照（含已知 coser + 路人）
         self.group_pids: list = []  # 合照中命中的所有已知 coser 的 person_id
         self._face_data: list = []  # 会话内暂存检测到的人脸（含 embedding），不入 to_dict
+        self._dt: datetime | None = None  # 拍摄时间（scan 内解析；扫描被打断时保证属性存在）
         self.id = Photo._next_id
         Photo._next_id += 1
 
@@ -321,15 +322,24 @@ def _resize_long(img, long_side):
     return np.ascontiguousarray(img)
 
 def _load_score_image(root, photo):
-    """加载评分用工作图：优先 1600 预览缓存，落空读原文件，缩到长边 1280。"""
+    """加载评分用工作图：优先 1600 预览缓存（签名校验），落空读原文件，缩到长边 1280。
+    未命中时把 1600 缓存落盘（评分首轮生成、后续复用）。"""
     import numpy as np
     from PIL import Image as _PIL
     try:
-        cf = _cache_path(Path(str(root)), photo, 1600)
-        if cf and cf.exists():
-            pil = _PIL.open(cf).convert('RGB')
+        data = _read_cache_bytes(root, photo, 1600) if root else None
+        if data:
+            pil = _PIL.open(io.BytesIO(data)).convert('RGB')
         else:
             pil = _PIL.open(photo.preview).convert('RGB')
+            # 懒生成 1600 缓存（HEIF 经 ffmpeg，快），供后续评分复用
+            if root:
+                try:
+                    d = make_thumb(photo.preview, 1600)
+                    if d:
+                        _write_cache_bytes(root, photo, 1600, d)
+                except Exception:
+                    pass
         return _resize_long(np.array(pil), _SCORE_LONG)
     except Exception:
         return None
@@ -847,7 +857,27 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
         print(f"!! 目录不存在: {root}")
         return []
 
-    files = list(root.rglob("*"))
+    # 打断机制：记录本次扫描代次，各耗时循环检查 _scan_gen_stale(gen)。
+    # 主页/新相册请求递增代次后，本扫描尽快提前退出（保留已扫缓存，不发布半成品）。
+    gen = _scan_gen_take()
+
+    # 收集文件：os.walk 替代 rglob("*")——边遍历边可打断，同时剪枝缓存/回收站目录
+    files = []
+    cancelled = False
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [dn for dn in dirnames if dn not in SKIP_DIRS]
+            for fn in filenames:
+                if files and len(files) % 500 == 0 and _scan_gen_stale(gen):
+                    cancelled = True
+                    break
+                files.append(Path(dirpath) / fn)
+            if cancelled:
+                break
+    except OSError:
+        cancelled = True
+    if cancelled:
+        print("  > 扫描已打断（用户切换主页/相册），保留已收集的部分缓存")
     previews = [f for f in files if f.suffix in PREVIEW_EXTS
                 and f.parent.name not in SKIP_DIRS and is_real_photo(f)]
     if not previews:
@@ -867,7 +897,10 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     previews = list(by_stem.values())
 
     photos = []
-    for f in previews:
+    for i, f in enumerate(previews):
+        if i % 100 == 0 and i > 0 and _scan_gen_stale(gen):
+            print(f"  > 扫描已打断（构造照片阶段，已处理 {i} 张）")
+            break
         p = Photo(f); p.find_raw(); photos.append(p)
 
     photos.sort(key=lambda p: p.num)
@@ -875,21 +908,21 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
         return []
 
     # 还原持久化状态（keep/star/score）
-    _restore_state(photos, load_state(str(root)))
-    # 检测历史导出目录，把仍在原相册中的已导出 ARW 对应照片默认选中（提醒已导出过）
-    _mark_previously_exported(root, photos)
+    state = load_state(str(root))
+    _restore_state(photos, state)
+    # 反向选中：检测历史导出目录，把仍在原相册中的已导出 ARW 对应照片默认选中
+    # （仅对尚无持久化记录的照片生效，不覆盖用户已保存的手动选择）
+    newly_marked = _mark_previously_exported(root, photos, state)
 
     # 拍摄时间：优先命中持久化日期缓存（dates.json），未命中才解析 EXIF（JPG 走快速解析器）。
     # 二次打开同一相册时基本免解析，速度接近瞬时。
     dates = _load_dates(root)
     dates_dirty = False
-    for p in photos:
-        sig = ''
-        try:
-            st = p.preview.stat()
-            sig = f'{st.st_mtime:.0f}|{st.st_size}'
-        except OSError:
-            pass
+    for i, p in enumerate(photos):
+        if i % 50 == 0 and i > 0 and _scan_gen_stale(gen):
+            print(f"  > 扫描已打断（拍摄时间解析阶段，已处理 {i}/{len(photos)} 张）")
+            break
+        sig = _photo_sig(p.preview)
         rec = dates.get(str(p.preview)) if sig else None
         if rec and rec.get('sig') == sig and rec.get('dt'):
             try:
@@ -906,6 +939,9 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     # 分组（EXIF 时间权威：编号跳跃或间隔 >30s 拆组）
     groups = [[photos[0]]]
     for i in range(1, len(photos)):
+        if i % 200 == 0 and _scan_gen_stale(gen):
+            print(f"  > 扫描已打断（分组阶段），返回已扫部分数据")
+            break
         prev, cur = photos[i-1], photos[i]
         gap = cur.num - prev.num
         td = 999
@@ -914,6 +950,11 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
         if gap > 3 or td > 30:
             groups.append([])
         groups[-1].append(cur)
+    if _scan_gen_stale(gen):
+        # 被打断：保留已扫磁盘缓存；不启动后台评分，返回已扫部分（api_scan 不会发布）
+        if newly_marked:
+            save_state(str(root), groups)
+        return groups
 
     total_raw = sum(1 for p in photos if p.raw)
     print(f"> {len(photos)} 张, {total_raw} 张 ARW, {len(groups)} 个连拍组")
@@ -924,10 +965,14 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
         root_s = str(root)
         def _bg_score():
             global scoring_busy
+            my_gen = _scan_gen_take()  # 记录启动代次；主页/新扫描可打断本线程
             try:
-                pregenerate_cache(root_s, photos)
+                pregenerate_cache(root_s, photos, gen=my_gen)
+                if _scan_gen_stale(my_gen): return
                 compute_subbursts(root_s, groups)
+                if _scan_gen_stale(my_gen): return
                 score_groups(root_s, groups)
+                if _scan_gen_stale(my_gen): return
                 compute_roles(root_s, groups)
             except Exception as e:
                 print(f"  >> 后台评分异常: {e}")
@@ -938,13 +983,94 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     for i, g in enumerate(groups):
         if len(g) > 1:
             print(f"  组{i+1}: {len(g)} 张 ({g[0].num}-{g[-1].num})")
+    # 反向选中的新标记立即持久化，避免下次打开相册时丢失
+    if newly_marked:
+        save_state(str(root), groups)
+    # 清理孤儿缓存（旧 id 命名 / 已删除照片的残留），避免磁盘堆积两套缓存
+    _cleanup_orphan_caches(root, photos)
     return groups
 
 # ═══════════════════════════════════════════════════════════
 #  图片服务 + 缓存
 # ═══════════════════════════════════════════════════════════
 
+_FFMPEG_CACHE: str | None = None
+_FFMPEG_SEARCHED = False
+
+def _find_ffmpeg() -> str | None:
+    """定位 ffmpeg 可执行文件：PATH → WinGet Gyan → 常见目录 → ~/.tgphoto/ffmpeg.exe。
+    找不到返回 None（调用方回退 pillow-heif CPU 解码）。结果缓存。"""
+    global _FFMPEG_CACHE, _FFMPEG_SEARCHED
+    if _FFMPEG_SEARCHED:
+        return _FFMPEG_CACHE
+    _FFMPEG_SEARCHED = True
+    import shutil, glob as _g
+    try:
+        p = shutil.which('ffmpeg')
+        if p:
+            _FFMPEG_CACHE = p
+            return p
+    except Exception:
+        pass
+    cands = [
+        Path.home() / '.tgphoto' / 'ffmpeg.exe',
+        Path(r'C:\Program Files\ffmpeg\bin\ffmpeg.exe'),
+    ]
+    try:
+        for pat in (r'C:\Users\*\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*\bin\ffmpeg.exe',):
+            hits = _g.glob(pat)
+            if hits:
+                cands.insert(0, Path(hits[0]))
+                break
+    except Exception:
+        pass
+    for c in cands:
+        if c.exists():
+            _FFMPEG_CACHE = str(c)
+            return _FFMPEG_CACHE
+    _FFMPEG_CACHE = None
+    return None
+
+def _hif_to_jpeg_bytes(src: Path, size: int = 0, qscale: int = 3) -> bytes | None:
+    """用 ffmpeg 解码 HEIF/HIF → JPEG bytes（stdout 管道，不经磁盘）。
+    HEVC 解码器比 libheif/pillow-heif 快数倍；固定 -threads 2 让并发解码
+    （多核并行）不吃亏（单张速度几乎不降）。注意：tile-grid 拼贴 HEIF 在
+    ffmpeg 内部用 xstack 复杂滤镜拼图，不能加 -vf scale（简单/复杂滤镜冲突），
+    因此本函数始终输出原分辨率，缩放由调用方（PIL）完成。
+    qscale 为 ffmpeg quantizer（2-31，越小质量越高；默认 3 高质）。
+    失败返回 None（调用方回退 pillow）。"""
+    ff = _find_ffmpeg()
+    if not ff:
+        return None
+    cmd = [ff, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2',
+           '-i', str(src), '-frames:v', '1',
+           '-q:v', str(qscale), '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=120,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+    except Exception as e:
+        print(f"  !! ffmpeg 解码失败 {src.name}: {e}")
+    return None
+
 def make_thumb(path: Path, size: int = THUMB_W, quality: int = 85) -> bytes | None:
+    if path.suffix.upper() in ('.HIF', '.HEIC'):
+        # HEIF：ffmpeg 全分辨率解码（快数倍）→ PIL 缩放，失败回退 pillow 直解。
+        # 中间 4K JPEG 用 qscale 5（中等即可，缩小后无损：q:v 85/92 是 quantizer
+        # 会被解释为最大量化=垃圾质量，放大即马赛克，必须避免）。
+        data = _hif_to_jpeg_bytes(path, 0, 5)
+        if data:
+            try:
+                img = Image.open(io.BytesIO(data))
+                w, h = img.size
+                if w > size:
+                    img = img.resize((size, int(h * size / w)), Image.BILINEAR)
+                buf = io.BytesIO()
+                img.save(buf, 'JPEG', quality=quality)
+                return buf.getvalue()
+            except Exception:
+                pass
     try:
         img = Image.open(path)
         # 用 draft 快速解码到目标尺寸附近，避免解码全分辨率
@@ -972,9 +1098,12 @@ def serve_image(path: Path) -> bytes | None:
             print(f"  !! 读取失败: {path.name} -- {e}")
             return None
     elif ext in ('.HIF', '.HEIC'):
-        # 高清预览：按原分辨率解码（浏览器不原生支持 HEIF，需转 JPEG）；
-        # size 取极大值使 make_thumb 不做下采样，保留原图像素，放大才不糊。
-        # 首次生成较慢（全分辨率解码），浏览器端命中缓存后仍秒开。
+        # 高清预览：按原分辨率解码（浏览器不原生支持 HEIF，需转 JPEG）。
+        # ffmpeg qscale 2 高质量（q:v 89/92 会被当 quantizer 钳成最差质量→放大马赛克）。
+        # 优先 ffmpeg 转换（快数倍），失败回退 pillow；命中缓存后秒开。
+        data = _hif_to_jpeg_bytes(path, 0, 2)
+        if data:
+            return data
         return make_thumb(path, size=65535, quality=92)
     return None
 
@@ -982,19 +1111,26 @@ def _cache_dir(root: Path) -> Path:
     return root / '_tg_cache'
 
 # ── 全分辨率预览缓存（HIF）──────────────────────────────
-# 浏览器不原生支持 HEIF，需转 JPEG 才能预览；全分辨率转换较慢（1-3s/张）。
+# 浏览器不原生支持 HEIF，需转 JPEG 才能预览；全分辨率转换较慢（0.7-1.5s/张）。
 # 用签名 sidecar 校验源文件未变则直接复用，避免每次打开都重新解码。
+# 签名带 v2 前缀：编码质量升级（qscale 修正）后旧缓存自动失效重建。
+_PREVIEW_FULL_SIG_V = 'v2|'
+
 def _preview_full_path(root: Path, photo) -> Path:
-    return _cache_dir(root) / f'preview_full_{photo.id}.jpg'
+    return _cache_dir(root) / f'preview_full_{_path_hash(photo.preview)}.jpg'
+
+def _path_hash(path: Path) -> str:
+    """按绝对路径哈希，把缓存文件与照片路径绑定（免疫扫描顺序/id 变化导致的错配）。"""
+    import hashlib
+    return hashlib.md5(str(path.resolve()).encode('utf-8')).hexdigest()[:16]
 
 def _read_preview_full(root: Path, photo) -> bytes | None:
     cf = _preview_full_path(root, photo)
     if not cf.exists():
         return None
     try:
-        st = photo.preview.stat()
-        sig = f'{st.st_mtime:.0f}|{st.st_size}'
-    except OSError:
+        sig = _PREVIEW_FULL_SIG_V + _photo_sig(photo.preview)
+    except Exception:
         return None
     try:
         if cf.with_suffix('.sig').read_text().strip() == sig:
@@ -1011,10 +1147,9 @@ def _write_preview_full(root: Path, photo, data: bytes) -> None:
         tmp.write_bytes(data)
         os.replace(tmp, cf)
         try:
-            st = photo.preview.stat()
-            sig = f'{st.st_mtime:.0f}|{st.st_size}'
-        except OSError:
-            sig = ''
+            sig = _PREVIEW_FULL_SIG_V + _photo_sig(photo.preview)
+        except Exception:
+            sig = _PREVIEW_FULL_SIG_V
         ts = cf.with_suffix('.sig.tmp')
         ts.write_text(sig)
         os.replace(ts, cf.with_suffix('.sig'))
@@ -1075,9 +1210,11 @@ def _save_faces(root: Path, faces: dict) -> None:
         pass
 
 def _photo_sig(path: Path) -> str:
+    """源文件签名：纳秒级 mtime + size。用于缓存/解析结果与源文件绑定，
+    秒级 mtime 在同秒写入、大小相近的照片（连拍）之间会碰撞导致缓存错配。"""
     try:
         st = path.stat()
-        return f'{st.st_mtime:.0f}|{st.st_size}'
+        return f'{st.st_mtime_ns}|{st.st_size}'
     except OSError:
         return ''
 
@@ -1108,27 +1245,47 @@ def _face_from_json(d) -> dict:
     }
 
 def _cache_path(root: Path, photo: Photo, size: int) -> Path:
-    name = f'thumb_{photo.id}.jpg' if size <= 500 else f'preview_{photo.id}.jpg'
+    # 按照片绝对路径哈希命名（与路径绑定，免疫扫描顺序/id 变化导致的缓存错配）
+    name = f'thumb_{_path_hash(photo.preview)}.jpg' if size <= 500 else f'preview_{_path_hash(photo.preview)}.jpg'
     return _cache_dir(root) / name
 
-def pregenerate_cache(root: str, photos: list):
+def pregenerate_cache(root: str, photos: list, gen: int | None = None):
+    """批量生成缩略图缓存（250px，浏览用）。1600 预览缓存仅在评分时按需生成
+    （_load_score_image 内懒生成），避免为新相册的 HIF 白生成无用的 1600 缓存。
+    gen 非空时检查扫描代次，被主页/新扫描打断则提前停止。
+    并行生成（ThreadPoolExecutor，最多 8 并发）：HEIF 解码走 ffmpeg 子进程，
+    多核并行使批量预热远快于逐张串行（GPU 因每张初始化开销反而无优势）。"""
     import time as _t
+    from concurrent.futures import ThreadPoolExecutor
     root_p = Path(root).resolve()
     cache = _cache_dir(root_p)
     cache.mkdir(exist_ok=True)
     t0 = _t.time()
-    count = 0
-    for p in photos:
-        tp = _cache_path(root_p, p, 250)
-        if not tp.exists():
+
+    def gen_one(p) -> int:
+        if gen is not None and _scan_gen_stale(gen):
+            return 0
+        if _read_cache_bytes(root_p, p, 250) is None:
             d = make_thumb(p.preview, 250)
-            if d: _write_cache_bytes(root_p, p, 250, d); count += 1
-        pp = _cache_path(root_p, p, 1600)
-        if not pp.exists():
-            d = make_thumb(p.preview, 1600)
-            if d: _write_cache_bytes(root_p, p, 1600, d); count += 1
-        if (p.id + 1) % 100 == 0:
-            print(f"  cache {p.id+1}/{len(photos)}...", end='', flush=True)
+            if d:
+                _write_cache_bytes(root_p, p, 250, d)
+                return 1
+        return 0
+
+    count = 0
+    workers = min(8, max(1, (os.cpu_count() or 4)))
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        for i, n in enumerate(ex.map(gen_one, photos)):
+            count += n
+            if (i + 1) % 100 == 0:
+                print(f"  cache {i+1}/{len(photos)} ({count} 个)...", end='', flush=True)
+            if gen is not None and i % 20 == 0 and i > 0 and _scan_gen_stale(gen):
+                # 打断：取消未开始的排队任务（正在执行的让其自然完成），尽快释放 CPU
+                print(f"  > 缓存生成已打断（已生成 {count} 个）")
+                break
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
     el = _t.time() - t0
     if count: print(f"  生成 {count} 个缓存 ({el:.0f}s)")
     else: print(f"  缓存已就绪 ({el:.0f}s)")
@@ -1240,21 +1397,41 @@ def _exported_arw_names(root: Path) -> set:
     return exported
 
 
-def _mark_previously_exported(root: Path, photos: list) -> int:
-    """检测相册内的"挑选_YYYYMMDD_HHMMSS"导出目录，找出其中导出的 ARW 文件名。
-    若这些 ARW 仍存在于原相册（photo.raw 存在），则对应照片标记 keep=True（提醒已导出过）。
-    返回标记的照片数。只读不改，不覆盖用户手动取消的选中。"""
+def _latest_export_dir(root: Path) -> Path | None:
+    """返回相册内最新的"挑选_*"导出目录（按名称时间戳排序取最后一个）；不存在返回 None。
+    导出一律增量追加到该目录，避免每次新建目录导致挑选结果分散。"""
+    if not root.is_dir():
+        return None
+    dirs = []
+    try:
+        for d in root.iterdir():
+            if d.is_dir() and d.name.startswith('挑选_'):
+                dirs.append(d)
+    except OSError:
+        return None
+    if not dirs:
+        return None
+    dirs.sort(key=lambda d: d.name)
+    return dirs[-1]
+
+
+def _mark_previously_exported(root: Path, photos: list, state: dict | None = None) -> int:
+    """反向选中：检测相册内"挑选_YYYYMMDD_HHMMSS"导出目录里的 ARW 文件名。
+    若这些 ARW 仍存在于原相册（photo.raw 存在），则对应照片默认标记 keep=True（提醒已导出过）。
+    state 为已加载的持久化状态（{path: {...}}）：仅当该照片尚无持久化记录（首次发现）时才自动选中，
+    否则尊重用户此前在界面上的手动选择（含取消），不覆盖。
+    返回本次新标记选中的照片数（供调用方决定是否持久化）。"""
     exported = _exported_arw_names(root)
     if not exported:
         return 0
-    # 标记：照片有对应 raw 且 raw 文件名在已导出集合中 → keep=True
     count = 0
     for p in photos:
         if p.raw and p.raw.name in exported:
-            p.keep = True
-            count += 1
+            if state is None or str(p.preview) not in state:
+                p.keep = True
+                count += 1
     if count:
-        print(f"  > 检测到 {count} 张已导出过的照片（{len(exported)} 个 ARW 曾在挑选目录中），已默认选中")
+        print(f"  > 反向选中 {count} 张历史已导出照片（{len(exported)} 个 ARW 曾在挑选目录中）")
     return count
 
 def compute_delete_list(groups, mode: str, types) -> tuple[list[Path], list[str]]:
@@ -1318,30 +1495,41 @@ def _cleanup_empty_dirs(root, dirs) -> None:
             pass
 
 def _read_cache_bytes(root, photo, size) -> bytes | None:
+    """读缩略图/预览缓存。签名 sidecar（源文件 mtime|size）缺失或不匹配 → 视为无效。
+    防两类问题：源文件被替换后显示旧图；扫描顺序变化导致 id 错位、缓存与照片错配。"""
     cf = _cache_path(Path(str(root)), photo, size) if root else None
     if cf and cf.exists():
         try:
+            sigf = cf.with_suffix('.sig')
+            if not sigf.exists():
+                return None  # 旧格式缓存（无签名）→ 强制重新生成
+            if sigf.read_text().strip() != _photo_sig(photo.preview):
+                return None  # 源文件已变 / id 已错配 → 重新生成
             return cf.read_bytes()
         except Exception:
             return None
     return None
 
 def _write_cache_bytes(root, photo, size, data: bytes) -> None:
-    """把生成的缩略图原子写入 _tg_cache，下次请求直接读，避免重复解码。"""
+    """把生成的缩略图原子写入 _tg_cache，并写签名 sidecar（下次请求校验源文件未变）。"""
     try:
         cf = _cache_path(Path(str(root)), photo, size)
         cf.parent.mkdir(parents=True, exist_ok=True)
         tmp = cf.with_suffix('.jpg.tmp')
         tmp.write_bytes(data)
         os.replace(tmp, cf)
+        try:
+            stmp = cf.with_suffix('.sig.tmp')
+            stmp.write_text(_photo_sig(photo.preview))
+            os.replace(stmp, cf.with_suffix('.sig'))
+        except Exception:
+            pass
     except Exception:
         pass
 
 def _cover_cache_path(path: Path) -> Path:
     """封面等无 id 缩略图：按绝对路径哈希缓存到所属相册的 _tg_cache。"""
-    import hashlib
-    h = hashlib.md5(str(path.resolve()).encode('utf-8')).hexdigest()[:16]
-    return path.parent / '_tg_cache' / f'cov_{h}.jpg'
+    return path.parent / '_tg_cache' / f'cov_{_path_hash(path)}.jpg'
 
 def _read_cover_cache(path: Path) -> bytes | None:
     try:
@@ -1360,6 +1548,43 @@ def _write_cover_cache(path: Path, data: bytes) -> None:
     except Exception:
         pass
 
+def _cleanup_orphan_caches(root: Path, photos: list) -> int:
+    """清理 _tg_cache 中不属于任何当前照片的缩略图/预览缓存（孤儿）。
+    场景：缓存命名升级（id → 路径哈希）后旧缓存残留；或相册增删照片后已删除照片的缓存残留。
+    只删 thumb_/preview_/preview_full_ 前缀的缓存及其 .sig，保留 dates/faces/state 等。
+    返回删除数。幂等：重复调用第二次删除 0 个。"""
+    try:
+        cache = _cache_dir(root)
+        if not cache.is_dir():
+            return 0
+        valid = {_path_hash(p.preview) for p in photos}
+        removed = 0
+        for f in list(cache.iterdir()):
+            n = f.name
+            if not (n.endswith('.jpg') and (n.startswith('thumb_')
+                                            or n.startswith('preview_')
+                                            or n.startswith('preview_full_'))):
+                continue
+            pfx = next((p for p in ('thumb_', 'preview_', 'preview_full_') if n.startswith(p)), None)
+            if pfx is None:
+                continue
+            h = n[len(pfx):-4]
+            if h in valid:
+                continue  # 当前照片的缓存，保留
+            try:
+                f.unlink()
+                s = f.with_suffix('.sig')
+                if s.exists():
+                    s.unlink()
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(f"  > 清理 {removed} 个孤儿缓存（旧命名/已删除照片）")
+        return removed
+    except Exception:
+        return 0
+
 # ═══════════════════════════════════════════════════════════
 #  HTTP 服务器
 # ═══════════════════════════════════════════════════════════
@@ -1376,6 +1601,34 @@ _state_lock = threading.RLock()
 _mp_lock = threading.Lock()
 # 后台评分进行中标志
 scoring_busy: bool = False
+
+# ── 扫描打断机制 ─────────────────────────────────────
+# 每次发起新扫描或切换到相册首页（主页）时 _scan_gen += 1，当前扫描在各耗时
+# 检查点发现自身代次已过期即提前退出：保留已扫的磁盘缓存/状态，不发布半成品数据，
+# 主页/新请求即可立即响应（扫描期间不持 _state_lock，避免阻塞其他请求）。
+_scan_lock = threading.Lock()
+_scan_gen = 0
+# 扫描串行锁：同一时刻只允许一个 scan() 在跑（ThreadingHTTPServer 下两个 /api/scan
+# 并发会互相重置 Photo._next_id 导致 id 冲突、数据错乱）。
+# 注意：主页请求（api_data albums）只 bump 代次、不拿此锁，始终能立即响应。
+_scan_run_lock = threading.Lock()
+
+def _scan_gen_take() -> int:
+    """取当前扫描代次（本次扫描的身份标识）。"""
+    with _scan_lock:
+        return _scan_gen
+
+def _scan_gen_bump() -> int:
+    """使所有进行中的扫描失效并返回新代次（新扫描/主页请求调用）。"""
+    global _scan_gen
+    with _scan_lock:
+        _scan_gen += 1
+        return _scan_gen
+
+def _scan_gen_stale(gen: int) -> bool:
+    """该代次的扫描是否已被更新请求（主页/新相册）取消。"""
+    with _scan_lock:
+        return gen != _scan_gen
 
 # 缓存的 MediaPipe 模型
 _face_landmarker = None
@@ -2012,6 +2265,116 @@ def _save_roots(roots: list) -> None:
     except Exception:
         pass
 
+# ── 相册状态标识（手动设定，跨会话持久）────────────────
+# 两种状态：
+#   'tidied'   = 已整理（内容整理过，仍会浏览）
+#   'archived' = 已归档（终态：只剩精华 ARW + 全部 HIF/HEIC/JPG，不再浏览，
+#                设置时删除 preview_full 缓存释放空间）
+# 状态由用户在主页手动切换，存全局 archived.json（与全局人物库同目录）。
+_FOLDER_STATES_MEM: dict | None = None
+
+def _archived_path() -> Path:
+    return _global_root() / 'archived.json'
+
+def _load_folder_states() -> dict:
+    """返回 {绝对路径: 'archived'|'tidied'}（内存缓存 + 磁盘）。
+    兼容旧格式：v1 只有 archived 列表，v2 增加 tidied 列表。"""
+    global _FOLDER_STATES_MEM
+    if _FOLDER_STATES_MEM is not None:
+        return _FOLDER_STATES_MEM
+    out = {}
+    try:
+        p = _archived_path()
+        if p.exists():
+            d = json.loads(p.read_text(encoding='utf-8'))
+            for x in (d.get('archived') or []):
+                if x:
+                    out[str(Path(x).resolve())] = 'archived'
+            for x in (d.get('tidied') or []):
+                if x:
+                    out[str(Path(x).resolve())] = 'tidied'
+    except Exception:
+        pass
+    _FOLDER_STATES_MEM = out
+    return out
+
+def _save_folder_states(states: dict) -> None:
+    """原子写入相册状态并同步内存缓存。states: {path: 'archived'|'tidied'}"""
+    global _FOLDER_STATES_MEM
+    _FOLDER_STATES_MEM = dict(states)
+    archived = sorted(p for p, s in states.items() if s == 'archived')
+    tidied = sorted(p for p, s in states.items() if s == 'tidied')
+    try:
+        p = _archived_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps({'version': 2, 'archived': archived, 'tidied': tidied},
+                                  ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+def _purge_preview_full(root: Path) -> int:
+    """删除相册 _tg_cache 下的全分辨率预览缓存（preview_full_*.jpg 及 .sig）。
+    归档终态不再需要预览，释放空间。只删 preview_full，保留 thumb/preview 等。
+    返回删除数。"""
+    try:
+        cache = _cache_dir(root)
+        if not cache.is_dir():
+            return 0
+        removed = 0
+        for f in list(cache.glob('preview_full_*.jpg')):
+            try:
+                f.unlink()
+                s = f.with_suffix('.sig')
+                if s.exists():
+                    s.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+    except Exception:
+        return 0
+
+# ── 相册状态 → 文件夹后缀（重命名标注）────────────────
+# 已归档 → 文件夹名加 _archive（沿用用户已有命名习惯）
+# 已整理 → 文件夹名加 _tidied
+_STATE_SUFFIX = {'archived': '_archive', 'tidied': '_tidied'}
+
+def _rename_with_suffix(path: Path, state: str) -> Path | None:
+    """把文件夹重命名为带状态后缀的名字（幂等：已有后缀则不变）。
+    返回新路径；失败返回 None。"""
+    try:
+        if not path.is_dir():
+            return None
+        suffix = _STATE_SUFFIX.get(state)
+        if not suffix:
+            return None
+        if path.name.endswith(suffix):
+            return path
+        new = path.with_name(path.name + suffix)
+        if new.exists():
+            return None  # 目标已存在，不覆盖
+        path.rename(new)
+        return new
+    except Exception:
+        return None
+
+def _rename_remove_suffix(path: Path) -> Path | None:
+    """移除文件夹名末尾的状态后缀（_archive / _tidied）。
+    返回新路径；无后缀/失败返回原路径或 None。"""
+    try:
+        for suffix in _STATE_SUFFIX.values():
+            if path.name.endswith(suffix):
+                new = path.with_name(path.name[:-len(suffix)])
+                if new.exists():
+                    return None  # 目标已存在
+                path.rename(new)
+                return new
+        return path
+    except Exception:
+        return None
+
 # ── 照片文件夹检测（相册发现）──────────────────────────
 def _count_photos(dirpath: Path) -> int:
     """统计目录内直接含有的预览照片数量（不递归）。"""
@@ -2115,6 +2478,7 @@ def _build_album_index(root: Path) -> list:
     有 _tg_cache/state.json 的读元数据；未扫过的目录快速直扫（计数+封面）。
     跳过不含照片的目录。"""
     import time as _t
+    folder_states = _load_folder_states()
     albums = []
     for d in sorted(root.iterdir()):
         if not d.is_dir() or d.name.startswith('_') or d.name.startswith('.') or d.name in SKIP_DIRS:
@@ -2153,6 +2517,7 @@ def _build_album_index(root: Path) -> list:
             'path': str(d), 'name': d.name, 'photo_count': photo_count,
             'date': date_str, 'persons': sorted(persons), 'roles': sorted(roles),
             'cover_path': cover_path, 'root': str(root),
+            'state': folder_states.get(str(d.resolve()), ''),
         })
     return albums
 
@@ -2563,6 +2928,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path == '/api/scan':     return self.api_scan(body)
             if p.path == '/api/export':   return self.api_export(body)
             if p.path == '/api/albums':   return self.api_albums(body)
+            if p.path == '/api/archive':  return self.api_archive(body)
             if p.path == '/api/reassign':  return self.api_reassign(body)
             if p.path == '/api/assign_role': return self.api_assign_role(body)
             if p.path == '/api/score':     return self.api_score(body)
@@ -2657,6 +3023,8 @@ class Handler(BaseHTTPRequestHandler):
             scan_is_root = bool(scan_root) and str(Path(scan_root).resolve()) in [str(Path(r).resolve()) for r in roots]
             # 相册首页：强制返回 / 当前目录是相册根 / 尚未进入具体相册（空 scan_root）
             if force_albums or cur_is_root or scan_is_root or not scan_root:
+                # 用户要回相册首页：递增扫描代次，让进行中的相册扫描尽快让路（打断机制）
+                _scan_gen_bump()
                 rlist = list(roots)
                 if (cur_is_root or scan_is_root) and str(Path(scan_root).resolve()) not in rlist:
                     rlist.append(str(Path(scan_root).resolve()))
@@ -2772,16 +3140,16 @@ class Handler(BaseHTTPRequestHandler):
         if photo_id is not None:
             p = get_photo_by_id(photo_id)
             if p is None: return self._placeholder()
-            # 优先用缓存的缩略图（250px），秒出
-            cf = _cache_path(Path(scan_root), p, 250) if scan_root else None
-            if cf and cf.exists():
-                data = cf.read_bytes()
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/jpeg')
-                self.send_header('Content-Length', str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
+            # 优先用缓存的缩略图（250px，签名校验，秒出）
+            if scan_root:
+                data = _read_cache_bytes(scan_root, p, 250)
+                if data:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
             # 无缓存时生成 400px 小图（比 800px 快）
             data = make_thumb(p.preview, 400)
             if not data: return self._placeholder()
@@ -3042,10 +3410,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok': True, 'dir': current_dir, 'view': 'albums',
                         'groups': [], 'albums': _build_album_index(Path(directory))})
             return
-        # 相册子目录：scan 照片（不自动评分）
+        # 相册子目录：可打断 + 串行扫描。先递增代次让在途扫描（含评分/缓存线程）失效，
+        # 再等前一个 scan 线程完全退出（防并发 id 冲突），期间主页请求仍可立即响应。
+        my_gen = _scan_gen_bump()
+        with _scan_run_lock:
+            result = scan(directory)
+        if _scan_gen_stale(my_gen):
+            # 已被主页/新相册请求取消：保留已扫磁盘缓存，但不发布半成品数据
+            return self._json({'ok': True, 'cancelled': True, 'dir': current_dir,
+                               'view': 'photos', 'groups': []})
         with _state_lock:
-            groups = scan(directory)
+            groups = result
             rebuild_photo_list()
+        # 后台自动预生成缩略图（可打断）：新相册 1000+ 张 HIF 打开即预热，
+        # 用户浏览时缩略图秒开；点主页/开其他相册时通过代次提前停止。
+        # 关键：代次必须在启动线程前固定（my_gen），否则线程调度延迟期间
+        # 用户已 bump（点主页），线程内再 take() 会取到新代次 → 预生成永不失效。
+        try:
+            root_s = str(Path(scan_root).resolve())
+            photos_flat = [p for g in groups for p in g]
+            pregen_gen = my_gen
+            def _bg_pregen():
+                try:
+                    pregenerate_cache(root_s, photos_flat, gen=pregen_gen)
+                except Exception as e:
+                    print(f"  >> 后台缩略图预生成异常: {e}")
+            threading.Thread(target=_bg_pregen, daemon=True).start()
+        except Exception:
+            pass
         self._json({
             'ok': True,
             'dir': current_dir, 'view': 'photos',
@@ -3069,13 +3461,21 @@ class Handler(BaseHTTPRequestHandler):
         scoring_busy = True
         root_s = str(Path(scan_root).resolve()) if scan_root else ''
         photos_flat = [p for g in groups for p in g]
+        # 代次在主线程固定：用户点评分后立即点主页，评分线程启动前 bump 已发生，
+        # 线程内再 take() 会取到新代次导致评分永不失效。
+        score_gen = _scan_gen_take()
         def _bg_score():
             global scoring_busy
+            my_gen = score_gen
             try:
-                pregenerate_cache(root_s, photos_flat)
+                pregenerate_cache(root_s, photos_flat, gen=my_gen)
+                if _scan_gen_stale(my_gen): return
                 compute_subbursts(root_s, groups)
+                if _scan_gen_stale(my_gen): return
                 compute_persons(root_s, groups)          # 批量聚类人物 + 全局质心匹配
+                if _scan_gen_stale(my_gen): return
                 score_groups(root_s, groups, dims=dims)  # 质量评分（闭眼基线用 person_id）
+                if _scan_gen_stale(my_gen): return
                 compute_roles(root_s, groups)
             except Exception as e:
                 print(f"  >> 后台评分异常: {e}")
@@ -3222,26 +3622,99 @@ class Handler(BaseHTTPRequestHandler):
         _save_album_cache(albums)
         return self._json({'ok': True, 'roots': roots, 'albums': albums})
 
+    def api_archive(self, body):
+        """POST /api/archive {path, state} → 手动设定相册状态，并自动重命名文件夹标注。
+        state: 'archived'(已归档, 后缀 _archive) | 'tidied'(已整理, 后缀 _tidied) | ''(清除, 移除后缀)。
+        设为 archived 时：互斥清除 tidied（移除 _tidied 后缀），删除 preview_full 缓存（保留 thumb）。
+        设为 tidied 时：若文件夹已带 _archive 后缀则拒绝（须先取消归档）。
+        返回最新跨根相册索引（带 state 字段）。"""
+        p = (body.get('path') or '').strip()
+        if not p:
+            return self._json({'ok': False, 'error': '缺少路径'})
+        rp = Path(p).resolve()
+        state = body.get('state', '')
+        if state not in ('archived', 'tidied', ''):
+            return self._json({'ok': False, 'error': '未知状态: ' + str(state)})
+        old_key = str(rp)
+        states = _load_folder_states()
+        try:
+            if state == 'archived':
+                # 互斥：先移除 _tidied 后缀，再加 _archive
+                removed = _rename_remove_suffix(rp)
+                if removed is None:
+                    return self._json({'ok': False, 'error': '文件夹重命名失败（目标已存在或不可写）'})
+                rp = removed
+                renamed = _rename_with_suffix(rp, 'archived')
+                if renamed is None:
+                    return self._json({'ok': False, 'error': '文件夹重命名失败（_archive 目标已存在）'})
+                rp = renamed
+                states.pop(old_key, None)
+                states.pop(str(removed), None)
+                states[str(rp)] = 'archived'
+                # 删除 preview_full 缓存（只删全分辨率预览，thumb 保留）
+                try:
+                    n = _purge_preview_full(rp)
+                    if n:
+                        print(f"  > 已归档：清理 {n} 个 preview_full 缓存（thumb 保留）")
+                except Exception:
+                    pass
+            elif state == 'tidied':
+                if rp.name.endswith(_STATE_SUFFIX['archived']):
+                    return self._json({'ok': False, 'error': '该相册已归档（_archive），请先取消归档'})
+                renamed = _rename_with_suffix(rp, 'tidied')
+                if renamed is None:
+                    return self._json({'ok': False, 'error': '文件夹重命名失败（_tidied 目标已存在）'})
+                rp = renamed
+                states.pop(old_key, None)
+                states[str(rp)] = 'tidied'
+            else:
+                # 清除：移除状态后缀
+                removed = _rename_remove_suffix(rp)
+                if removed is None:
+                    return self._json({'ok': False, 'error': '文件夹重命名失败（目标已存在或不可写）'})
+                rp = removed
+                states.pop(old_key, None)
+                states.pop(str(rp), None)
+        except Exception as e:
+            return self._json({'ok': False, 'error': '操作失败: ' + str(e)})
+        _save_folder_states(states)
+        # 重建索引并刷新缓存，让主页立即反映状态与文件夹名
+        albums = _rebuild_albums(_load_roots())
+        _save_album_cache(albums)
+        return self._json({'ok': True, 'states': states, 'albums': albums})
+
     def api_export(self, body):
         import shutil, datetime as dt
         kept = [p for g in groups for p in g if p.keep and p.raw]
         if not kept:
             return self._json({'ok': False, 'error': '没有选中的 ARW 文件'})
-        ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-        export_dir = Path(current_dir) / f'挑选_{ts}'
-        names = [p.raw.name for p in kept]
+        # 导出统一增量追加到"最新的挑选_<时间戳>"目录：首次创建，此后复用（不新建新目录）
+        export_dir = _latest_export_dir(Path(current_dir))
+        if export_dir is None:
+            ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_dir = Path(current_dir) / f'挑选_{ts}'
+        # 增量导出：已存在于任意历史"挑选_*"目录（含最新目录）中的 ARW 不再重复导出
+        already_names = _exported_arw_names(Path(current_dir))
+        new_photos = [p for p in kept if p.raw.name not in already_names]
         confirmed = body.get('confirmed', False)
         if not confirmed:
-            # 预览：返回待导出清单 + 已存在于历史导出目录中的文件（提示增量）
-            already = [n for n in names if n in _exported_arw_names(Path(current_dir))]
+            # 预览：返回本次将新增的清单 + 已存在（将跳过）的统计
+            already = [n for n in (p.raw.name for p in kept) if n in already_names]
             return self._json({
-                'ok': True, 'ready': True, 'dir': str(export_dir), 'count': len(names),
-                'files': names[:500], 'already': already, 'already_count': len(already),
+                'ok': True, 'ready': True, 'dir': str(export_dir),
+                'count': len(new_photos), 'total_count': len(kept),
+                'files': [p.raw.name for p in new_photos][:500],
+                'already': already, 'already_count': len(already),
             })
-        # 执行复制：跳过目标目录内已存在的同名文件（幂等，不覆盖）
+        if not new_photos:
+            # 全部已导出过：不新建目录，直接返回"无新增"
+            return self._json({'ok': True, 'done': True, 'dir': str(export_dir),
+                               'count': 0, 'skipped': 0, 'files': [],
+                               'already_count': len(kept)})
+        # 执行复制：只复制新增的 ARW（跳过已在历史导出目录中的）
         export_dir.mkdir(parents=True, exist_ok=True)
         copied, skipped = [], []
-        for p in kept:
+        for p in new_photos:
             dst = export_dir / p.raw.name
             if dst.exists():
                 skipped.append(p.raw.name)
@@ -3249,12 +3722,13 @@ class Handler(BaseHTTPRequestHandler):
             shutil.copy2(p.raw, dst)
             copied.append(p.raw.name)
         save_state(scan_root, groups)
-        if skipped:
-            print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}（跳过 {len(skipped)} 个已存在）")
+        prev_count = len(kept) - len(new_photos)
+        if prev_count:
+            print(f"> 增量导出 {len(copied)} 个新增 ARW 到 {export_dir.name}（跳过 {prev_count} 个此前已导出）")
         else:
             print(f"> 导出 {len(copied)} 个 ARW 到 {export_dir.name}")
         self._json({'ok': True, 'done': True, 'dir': str(export_dir), 'count': len(copied),
-                    'skipped': len(skipped), 'files': copied})
+                    'skipped': len(skipped), 'files': copied, 'already_count': prev_count})
 
     def api_delete(self, body):
         confirmed = body.get('confirmed', False)
@@ -3391,8 +3865,14 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .ainfo{padding:8px}
 .aname{font-size:11px;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ameta{font-size:10px;color:#666;margin-top:2px}
-.adots{display:flex;gap:2px;margin-top:4px}
+.adots{display:flex;gap:2px;margin-top:4px;align-items:center;flex-wrap:wrap}
 .adots .pdot{width:8px;height:8px;border-radius:2px}
+.arch-badge{display:inline-block;margin-left:4px;padding:1px 5px;font-size:9px;color:#f1c40f;background:rgba(241,196,15,.15);border:1px solid rgba(241,196,15,.4);border-radius:3px;vertical-align:middle}
+.tidy-badge{display:inline-block;margin-left:4px;padding:1px 5px;font-size:9px;color:#3498db;background:rgba(52,152,219,.15);border:1px solid rgba(52,152,219,.4);border-radius:3px;vertical-align:middle}
+.arch-btn{margin-left:auto;padding:2px 8px;font-size:10px;cursor:pointer;border:1px solid #555;border-radius:3px;background:#2c2c2c;color:#aaa}
+.arch-btn:hover{border-color:#f1c40f;color:#f1c40f}
+.arch-btn.on{color:#27ae60;border-color:#27ae60}
+.acard.arch{opacity:.62;border-color:#3a3a3a;background:#1e1e1e}
 .aroot{width:100%;margin-top:4px}
 .aroot-hdr{display:flex;align-items:center;gap:10px;padding:6px 2px;border-bottom:1px solid #2c2c2c;margin-bottom:4px}
 .aroot-name{font-size:13px;color:#eee;font-weight:600;white-space:nowrap}
@@ -3594,12 +4074,16 @@ let DATA=[], GROUPS=[], TP=0, TK=0, CACHE_BUST=0, FILTER_PID=null, FILTER_GROUP=
 let VIEW='photos'; // 'albums' | 'photos' | 'persons' | 'person_photos'
 let ALBUM_ROOT=''; // 相册根目录（打开相册时记住，返回时用）
 let LABEL_MODE=false, LABEL_SEL=new Set();
+let NAV_GEN=0; // 导航代次：每次切换视图/目录 +1，过期请求返回时不覆盖当前界面
 
 const PV={el:null,wrap:null,img:null,scale:1,tx:0,ty:0,drag:false,dsx:0,dsy:0,dtx:0,dty:0};
 
 async function load(v){const u=v==='albums'?'/api/data?view=albums':'/api/data';
+  const myGen=++NAV_GEN;
   const _g=document.getElementById('grp');if(_g)_g.innerHTML='<div style="padding:48px"><div class="spin"></div></div>';
-  const r=await fetch(u);const d=await r.json();DATA=d;
+  const r=await fetch(u);const d=await r.json();
+  if(myGen!==NAV_GEN)return; // 已被更新的导航覆盖（如回主页/开其他相册），丢弃过期结果
+  DATA=d;
   VIEW=d.view==='albums'?'albums':(d.view==='setup'?'setup':'photos');
   if(VIEW==='albums') ALBUM_ROOT=DATA.dir;
   render();updateButtons();updRootCnt()}
@@ -3692,11 +4176,25 @@ function setGroupFilter(pid){FILTER_GROUP=FILTER_GROUP===pid?null:pid;FILTER_PID
 // ── 相册列表视图（跨根目录聚合）──────────────
 function _albumCard(a){
   const pColors=(a.persons||[]).map(pid=>`<span class="pdot" style="background:${_pcol(pid)}"></span>`).join('');
-  return `<div class="acard" onclick="openAlbum('${a.path.replace(/\\/g,'\\\\\\\\')}')">
+  const st=a.state||'';
+  const archBadge=st==='archived'?'<span class="arch-badge" title="已归档：完成挑选归档，不再浏览">📦 已归档</span>':'';
+  const tidyBadge=st==='tidied'?'<span class="tidy-badge" title="已整理：内容已整理过">📋 已整理</span>':'';
+  // 两个独立按钮：已整理 / 已归档（已标记的可点击取消，未标记的点击设置）
+  const tidyBtn=`<button class="arch-btn ${st==='tidied'?'on':''}" onclick="event.stopPropagation();setFolderState('${a.path.replace(/\\/g,'\\\\\\\\')}','${st==='tidied'?'':'tidied'}')" title="${st==='tidied'?'取消整理':'标记为已整理'}">${st==='tidied'?'取消整理':'📋 整理'}</button>`;
+  const archBtn=`<button class="arch-btn ${st==='archived'?'on':''}" onclick="event.stopPropagation();setFolderState('${a.path.replace(/\\/g,'\\\\\\\\')}','${st==='archived'?'':'archived'}')" title="${st==='archived'?'取消归档':'标记为已归档'}">${st==='archived'?'取消归档':'📦 归档'}</button>`;
+  return `<div class="acard ${st==='archived'?'arch':''}" onclick="openAlbum('${a.path.replace(/\\/g,'\\\\\\\\')}')">
     <div class="acover"><img src="/thumb?p=${encodeURIComponent(a.cover_path||a.path)}&v=${CACHE_BUST}" loading="lazy" onerror="this.style.display='none'"></div>
-    <div class="ainfo"><div class="aname">${a.name}</div>
+    <div class="ainfo"><div class="aname">${a.name}${tidyBadge}${archBadge}</div>
     <div class="ameta">${a.photo_count}张 · ${a.date||''}</div>
-    <div class="adots">${pColors}</div></div></div>`;
+    <div class="adots">${pColors}${tidyBtn}${archBtn}</div></div></div>`;
+}
+async function setFolderState(path, state){
+  try{
+    const r=await fetch('/api/archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,state})});
+    const d=await r.json();
+    if(d.ok){DATA.albums=d.albums;renderAlbums();updateButtons();updRootCnt()}
+    else alert('操作失败: '+d.error)
+  }catch(e){alert('请求失败: '+e.message)}
 }
 function _rootName(r){const p=r.replace(/\\/g,'/').replace(/\/$/,'');const i=p.lastIndexOf('/');return i>=0?p.substring(i+1):p}
 function renderAlbums(){
@@ -4021,22 +4519,26 @@ function upd(){
 async function openDir(){
   const inp=document.getElementById('dirInput'),btn=document.getElementById('openBtn');
   const dir=inp.value.trim();if(!dir)return;
+  const myGen=++NAV_GEN; // 本请求导航代次：期间若用户回主页/开其他相册，结果作废
   btn.disabled=true;btn.textContent='扫描中…';
   document.getElementById('st').textContent='扫描目录中…';
   try{
     const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({directory:dir})});
     const d=await r.json();
+    if(myGen!==NAV_GEN)return; // 已导航走（如回主页），丢弃过期扫描结果（后端已让路）
     if(!d.ok){alert('目录扫描失败: '+d.error);return}
     CACHE_BUST=Date.now();DATA=d;closePreview();
     if(d.view==='albums'){
       VIEW='albums';ALBUM_ROOT=d.dir;
       // 补充获取 persons/roles（scan 只返回了 albums）
-      try{const d2=await(await fetch('/api/data')).json();DATA=d2}catch(e){}
+      try{const d2=await(await fetch('/api/data')).json();if(myGen===NAV_GEN)DATA=d2}catch(e){}
     }else{VIEW='photos'}
     render();
     updateButtons();
-  }catch(e){alert('请求失败: '+e.message)}
-  finally{btn.disabled=false;btn.textContent='打开'}
+  }catch(e){if(myGen===NAV_GEN)alert('请求失败: '+e.message)}
+  finally{
+    if(myGen===NAV_GEN){btn.disabled=false;btn.textContent='打开'}
+  }
 }
 function openAlbum(path){
   // 记住相册根目录（打开相册时，DATA.dir 是根目录）
@@ -4046,8 +4548,10 @@ function openAlbum(path){
 }
 function backToAlbums(){
   // 回到相册首页（跨根聚合）；未配置根时后端返回引导页
+  NAV_GEN++; // 使在途的扫描/加载请求作废（后端扫描也会随之让路）
   ALBUM_ROOT='';
   VIEW='albums';
+  document.getElementById('st').textContent='';
   load('albums');
 }
 function updateButtons(){
@@ -4172,16 +4676,19 @@ async function exportARW(){
     if(!d.ok){mb.innerHTML='<p>'+esc(d.error)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>';return}
     let fl=(d.files||[]).map(f=>'<div>'+esc(f)+'</div>').join('');
     if(d.files.length<d.count)fl+='<div style="color:#555">…还有'+(d.count-d.files.length)+'个</div>';
-    const alreadyNote=(d.already_count>0)?`<p style="font-size:12px;color:#e67e22">⚠ 其中 ${d.already_count} 个已在历史导出目录中出现过</p>`:'';
+    const alreadyNote=(d.already_count>0)?`<p style="font-size:12px;color:#e67e22">⚠ ${d.already_count} 个已存在于历史挑选目录中，本次增量将跳过</p>`:'';
+    const emptyNote=(d.count===0)?`<p style="font-size:12px;color:#e67e22">所有选中的 ARW 均已导出过，没有新增需要导出。</p>`:'';
+    const actions=(d.count===0)
+      ?`<button class="btn btn-cancel" onclick="md.classList.remove('on')">关闭</button>`
+      :`<button class="btn btn-cancel" onclick="md.classList.remove('on')">取消</button>
+        <button class="btn export" onclick="exportARWConfirm()">确认导出</button>`;
     mb.innerHTML=`<h2 style="color:#2980b9">导出 ARW</h2>
-      <p>将复制 <b>${d.count}</b> 个 ARW 到:</p>
+      <p>将新增复制 <b>${d.count}</b> 个 ARW 到:</p>
       <p style="font-size:12px;color:#888;word-break:break-all">${esc(d.dir)}</p>
       ${alreadyNote}
+      ${emptyNote}
       <div class="flist">${fl}</div>
-      <div class="ma">
-        <button class="btn btn-cancel" onclick="md.classList.remove('on')">取消</button>
-        <button class="btn export" onclick="exportARWConfirm()">确认导出</button>
-      </div>`
+      <div class="ma">${actions}</div>`
   }catch(e){mb.innerHTML='<p>导出失败: '+esc(e.message)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>'}
 }
 
@@ -4192,8 +4699,14 @@ async function exportARWConfirm(){
     const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});
     const d=await r.json();
     if(!d.ok){mb.innerHTML='<p>'+esc(d.error)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>';return}
+    let summary;
+    if(d.count===0){
+      summary=`<p>没有新增的 ARW：选中的 ${d.already_count||0} 个此前均已导出过。</p>`;
+    }else{
+      summary=`<p>已新增复制 <b>${d.count}</b> 个 ARW${d.already_count?`，另有 ${d.already_count} 个此前已导出（未重复复制）`:''}到:</p>`;
+    }
     mb.innerHTML=`<h2 style="color:#27ae60">导出完成</h2>
-      <p>已复制 ${d.count} 个 ARW${d.skipped?`，跳过 ${d.skipped} 个已存在`:''}到:</p>
+      ${summary}
       <p style="font-size:12px;color:#888;word-break:break-all">${esc(d.dir)}</p>
       <div class="ma"><button class="btn refresh" onclick="md.classList.remove('on')">关闭</button></div>`
   }catch(e){mb.innerHTML='<p>导出失败: '+esc(e.message)+'</p><div class="ma"><button class="btn btn-cancel" onclick="md.classList.remove(\'on\')">关闭</button></div>'}
