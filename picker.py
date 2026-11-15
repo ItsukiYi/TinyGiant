@@ -1046,8 +1046,9 @@ def _hif_to_jpeg_bytes(src: Path, size: int = 0, qscale: int = 3) -> bytes | Non
            '-i', str(src), '-frames:v', '1',
            '-q:v', str(qscale), '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=120,
-                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        with _FFMPEG_SEM:  # 限全局 ffmpeg 并发（防批量生成时 CPU 爆满）
+            r = subprocess.run(cmd, capture_output=True, timeout=120,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if r.returncode == 0 and r.stdout:
             return r.stdout
     except Exception as e:
@@ -1612,6 +1613,26 @@ _scan_gen = 0
 # 并发会互相重置 Photo._next_id 导致 id 冲突、数据错乱）。
 # 注意：主页请求（api_data albums）只 bump 代次、不拿此锁，始终能立即响应。
 _scan_run_lock = threading.Lock()
+
+# ── 图片生成并发与打断 ─────────────────────────────
+# ffmpeg 子进程全局并发上限：前端首屏几十个 /thumb 缓存 miss 时同时启动 ffmpeg
+# 会把 16 核占满，主页请求抢不到 CPU → 点主页"转半天圈"。限 4 个并发（×2 线程=8 线程），
+# 留一半 CPU 给 HTTP 处理/主页响应。
+_FFMPEG_SEM = threading.Semaphore(4)
+# 用户切到主页后置 True：在途的照片缩略图/预览生成请求快速放弃（返回占位图），
+# 不再排队生成用户已经看不到的图；新开相册（scan 成功）时置 False 恢复。
+# 仅拦截"照片"请求（photo_id 分支）；主页封面（无 id 路径）不受影响。
+_gen_pause = False
+_gen_pause_lock = threading.Lock()
+
+def _set_gen_pause(v: bool) -> None:
+    global _gen_pause
+    with _gen_pause_lock:
+        _gen_pause = v
+
+def _gen_paused() -> bool:
+    with _gen_pause_lock:
+        return _gen_pause
 
 def _scan_gen_take() -> int:
     """取当前扫描代次（本次扫描的身份标识）。"""
@@ -3048,8 +3069,10 @@ class Handler(BaseHTTPRequestHandler):
             scan_is_root = bool(scan_root) and str(Path(scan_root).resolve()) in [str(Path(r).resolve()) for r in roots]
             # 相册首页：强制返回 / 当前目录是相册根 / 尚未进入具体相册（空 scan_root）
             if force_albums or cur_is_root or scan_is_root or not scan_root:
-                # 用户要回相册首页：递增扫描代次，让进行中的相册扫描尽快让路（打断机制）
+                # 用户要回相册首页：递增扫描代次，让进行中的相册扫描尽快让路（打断机制）；
+                # 置 gen_pause 使在途照片图片生成请求快速放弃（不占 CPU 生成用户已看不到的图）
                 _scan_gen_bump()
+                _set_gen_pause(True)
                 rlist = list(roots)
                 if (cur_is_root or scan_is_root) and str(Path(scan_root).resolve()) not in rlist:
                     rlist.append(str(Path(scan_root).resolve()))
@@ -3175,6 +3198,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(data)
                     return
+            # 用户已切到主页：不现场生成（返回占位，避免占用 CPU）
+            if _gen_paused():
+                return self._placeholder()
             # 无缓存时生成 400px 小图（比 800px 快）
             data = make_thumb(p.preview, 400)
             if not data: return self._placeholder()
@@ -3225,6 +3251,9 @@ class Handler(BaseHTTPRequestHandler):
                 if data:
                     return self._send_jpeg(data)
         if size <= 500:
+            # 用户已切到主页：缓存未命中的照片缩略图不再现场生成（返回占位，避免占用 CPU）
+            if photo_id is not None and _gen_paused():
+                return self._placeholder()
             data = make_thumb(path, size)
             if data:
                 # 按需落盘：下次滚动/回访直接读缓存，不再重复解码
@@ -3241,6 +3270,9 @@ class Handler(BaseHTTPRequestHandler):
             if photo_id is not None and scan_root and path.suffix.upper() in ('.HIF', '.HEIC'):
                 data = _read_preview_full(Path(scan_root), p)
                 if not data:
+                    # 用户已切到主页：不现场做慢速全分辨率转换
+                    if _gen_paused():
+                        return self._placeholder()
                     data = serve_image(path)
                     if data:
                         _write_preview_full(Path(scan_root), p, data)
@@ -3442,11 +3474,13 @@ class Handler(BaseHTTPRequestHandler):
             result = scan(directory)
         if _scan_gen_stale(my_gen):
             # 已被主页/新相册请求取消：保留已扫磁盘缓存，但不发布半成品数据
+            _set_gen_pause(True)  # 用户已切走：在途图片生成也停止
             return self._json({'ok': True, 'cancelled': True, 'dir': current_dir,
                                'view': 'photos', 'groups': []})
         with _state_lock:
             groups = result
             rebuild_photo_list()
+        _set_gen_pause(False)  # 新相册浏览开始：恢复图片生成请求
         # 后台自动预生成缩略图（可打断）：新相册 1000+ 张 HIF 打开即预热，
         # 用户浏览时缩略图秒开；点主页/开其他相册时通过代次提前停止。
         # 关键：代次必须在启动线程前固定（my_gen），否则线程调度延迟期间
