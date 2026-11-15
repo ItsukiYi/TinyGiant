@@ -999,9 +999,14 @@ def test_merge_suggestions(tmp_path, monkeypatch):
 
 
 def test_migrate_persons_v4(tmp_path, monkeypatch):
-    """v3 → v4：单质心升级为多示例 embeddings=[prototype]。"""
+    """v3 → v4：单质心升级为多示例 embeddings=[prototype]（模型标记一致时不重建）。"""
     fake = tmp_path / 'v4'; fake.mkdir()
     monkeypatch.setattr(Path, 'home', lambda: fake)
+    monkeypatch.setattr(P, '_global_root_cache', None)   # 强制重算全局根到 fake
+    monkeypatch.setattr(P, '_roots_path', lambda: fake / 'roots.json')  # 无配置根 → 回退 home
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    monkeypatch.setattr(P, '_RECOG_MODEL', 'test-model')
     P._save_persons({'version': 3, 'persons': {
         '1': {'name': '花崎', 'confirmed': True, 'prototype': [0.1, 0.2], 'count': 5, 'created_at': 0},
     }, 'next_id': 2})
@@ -1010,6 +1015,47 @@ def test_migrate_persons_v4(tmp_path, monkeypatch):
     assert db['version'] == 4
     assert db['persons']['1']['embeddings'] == [[0.1, 0.2]]
     assert db['persons']['1']['prototype'] == [0.1, 0.2]
+
+
+def test_faces_cache_model_mismatch_ignored(tmp_path):
+    """换识别模型后 faces.json 缓存不匹配 → 忽略（重新检测）。"""
+    d = tmp_path / 'fm'; d.mkdir()
+    P._save_faces(d, {'D:/x/1.jpg': {'sig': 'a|1', 'faces': []}})
+    assert 'D:/x/1.jpg' in P._load_faces(d)
+    # 模拟旧模型缓存：改顶层 model 为 buffalo_s
+    p = P._faces_path(d)
+    data = json.loads(p.read_text(encoding='utf-8'))
+    data['model'] = 'buffalo_s'
+    p.write_text(json.dumps(data), encoding='utf-8')
+    assert P._load_faces(d) == {}  # 模型不匹配 → 忽略缓存
+
+
+def test_persons_model_change_backs_up_and_resets(tmp_path, monkeypatch):
+    """识别模型更换：旧库备份 + 重建空库（embedding 空间不兼容）。"""
+    fake = tmp_path / 'pm'; fake.mkdir()
+    monkeypatch.setattr(Path, 'home', lambda: fake)
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    monkeypatch.setattr(P, '_roots_path', lambda: fake / 'roots.json')
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, '_RECOG_MODEL', 'buffalo_l')
+    # 写入一个"旧模型"的非空库（手动构造带 model=buffalo_s 的文件）
+    p = P._persons_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({'version': 4, 'model': 'buffalo_s',
+                             'persons': {'1': {'name': '旧人', 'confirmed': True,
+                                               'prototype': [0.1], 'embeddings': [[0.1]]}},
+                             'next_id': 2}), encoding='utf-8')
+    P._PERSONS_MEM = None
+    db = P._load_persons()
+    assert db['model'] == 'buffalo_l'
+    assert db['persons'] == {}   # 旧 embedding 空间不兼容 → 空库
+    assert db['next_id'] == 1
+    # 备份文件已生成
+    backups = list(fake.rglob('persons_backup_*.json'))
+    assert len(backups) == 1
+    bd = json.loads(backups[0].read_text(encoding='utf-8'))
+    assert bd['model'] == 'buffalo_s'
+    assert '1' in bd['persons']
 
 
 def test_person_sim_multi_exemplar():

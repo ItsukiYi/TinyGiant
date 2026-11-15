@@ -322,8 +322,8 @@ def _resize_long(img, long_side):
     return np.ascontiguousarray(img)
 
 def _load_score_image(root, photo):
-    """加载评分用工作图：优先 1600 预览缓存（签名校验），落空读原文件，缩到长边 1280。
-    未命中时把 1600 缓存落盘（评分首轮生成、后续复用）。"""
+    """加载评分用工作图：优先 1600 预览缓存（签名校验），落空生成并落盘 1600 缓存
+    （HEIF 走 ffmpeg 中转，比 pillow 全分辨率解码快 3 倍左右），缩到长边 _SCORE_LONG。"""
     import numpy as np
     from PIL import Image as _PIL
     try:
@@ -331,15 +331,17 @@ def _load_score_image(root, photo):
         if data:
             pil = _PIL.open(io.BytesIO(data)).convert('RGB')
         else:
-            pil = _PIL.open(photo.preview).convert('RGB')
-            # 懒生成 1600 缓存（HEIF 经 ffmpeg，快），供后续评分复用
-            if root:
-                try:
-                    d = make_thumb(photo.preview, 1600)
-                    if d:
+            # 未命中：HEIF 经 ffmpeg 生成 1600 缓存（快），JPG 直接读原文件
+            d = make_thumb(photo.preview, 1600) if root else None
+            if d:
+                if root:
+                    try:
                         _write_cache_bytes(root, photo, 1600, d)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                pil = _PIL.open(io.BytesIO(d)).convert('RGB')
+            else:
+                pil = _PIL.open(photo.preview).convert('RGB')
         return _resize_long(np.array(pil), _SCORE_LONG)
     except Exception:
         return None
@@ -1190,12 +1192,14 @@ def _faces_path(root: Path) -> Path:
     return _cache_dir(root) / 'faces.json'
 
 def _load_faces(root: Path) -> dict:
+    """读取人脸检测缓存 {path: {sig, faces}}。模型与当前 _RECOG_MODEL 不一致 → 忽略（重新检测）。"""
     try:
         p = _faces_path(root)
         if p.exists():
             d = json.loads(p.read_text(encoding='utf-8'))
             if isinstance(d, dict) and isinstance(d.get('faces'), dict):
-                return d['faces']
+                if d.get('model') == _RECOG_MODEL:
+                    return d['faces']
     except Exception:
         pass
     return {}
@@ -1205,7 +1209,8 @@ def _save_faces(root: Path, faces: dict) -> None:
         p = _faces_path(root)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps({'version': 1, 'faces': faces}, ensure_ascii=False), encoding='utf-8')
+        tmp.write_text(json.dumps({'version': 2, 'model': _RECOG_MODEL, 'faces': faces},
+                                  ensure_ascii=False), encoding='utf-8')
         os.replace(tmp, p)
     except Exception:
         pass
@@ -1221,6 +1226,7 @@ def _photo_sig(path: Path) -> str:
 
 def _face_to_json(f) -> dict:
     lm = f.get('lm') or []
+    emb = f.get('embedding')
     return {
         'box': [float(v) for v in (f.get('box') or (0, 0, 0, 0))],
         'lm': [[float(x), float(y)] for x, y in lm] if lm else [],
@@ -1228,7 +1234,8 @@ def _face_to_json(f) -> dict:
         'area': float(f.get('area', 0.0)),
         'blink_l': float(f['blink_l']) if f.get('blink_l') is not None else 0.25,
         'blink_r': float(f['blink_r']) if f.get('blink_r') is not None else 0.25,
-        'embedding': [float(v) for v in (f.get('embedding') or [])],
+        # embedding 可能是 numpy 数组：不能 `or []`（真值歧义），显式判 None
+        'embedding': [float(v) for v in (emb if emb is not None else [])],
         'det_score': float(f.get('det_score', 0.5)),
     }
 
@@ -1845,14 +1852,16 @@ def _force_cpu_face_app():
         _face_app = None
         try:
             from insightface.app import FaceAnalysis
-            _face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+            _face_app = FaceAnalysis(name=_RECOG_MODEL, providers=['CPUExecutionProvider'])
             _face_app.prepare(ctx_id=-1, det_size=(640, 640))
         except Exception:
             _face_app = None
     return _face_app
 
 def _get_face_app():
-    """单例加载 InsightFace buffalo_s（检测+landmark+embedding+genderage）。
+    """单例加载 InsightFace（检测+landmark+embedding+genderage）。
+    模型 _RECOG_MODEL：buffalo_l（R50，识别力显著强于 buffalo_s 的 MobileFaceNet，
+    类内更紧凑、跨场景/妆造更稳定，有效减少"同一人拆成多簇"）。
     有 GPU 用 GPU（ctx_id=0），初始化失败自动回退 CPU。缺失返回 None。"""
     global _face_app
     if _face_app is None:
@@ -1861,7 +1870,7 @@ def _get_face_app():
                 providers, ctx_id = _gpu_providers()
                 try:
                     from insightface.app import FaceAnalysis
-                    _face_app = FaceAnalysis(name='buffalo_s', providers=providers)
+                    _face_app = FaceAnalysis(name=_RECOG_MODEL, providers=providers)
                     _face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
                 except Exception:
                     _face_app = None
@@ -1884,8 +1893,10 @@ _onnx_lock = threading.Lock()
 _persons_lock = threading.RLock()  # 可重入：_load_persons 内部也加锁（内存缓存）
 _face_recognizer = None  # onnxruntime.InferenceSession
 
-_RECOG_THRESHOLD = 0.45   # 匹配下限：≥此值才归类到已有人物（保守，避免相似不同人误合并）
-_RECOG_CONFIRM = 0.55     # 高置信直认阈值：≥此值不标 merge_pending
+_RECOG_MODEL = 'buffalo_l'  # 人脸识别模型包（R50，识别力/跨场景稳定性远强于 buffalo_s）
+                            # 换模型后 embedding 空间变化，faces/persons 缓存自动失效重建
+_RECOG_THRESHOLD = 0.42   # 匹配下限：≥此值才归类到已有人物（配合 buffalo_l，类内更紧凑）
+_RECOG_CONFIRM = 0.50     # 高置信直认阈值：≥此值不标 merge_pending
 _ARCFACE_SIZE = 112       # ArcFace 标准输入尺寸
 # ArcFace 对齐参考点（112×112 坐标系）
 _ARCFACE_REF = np.array([[38.2946, 51.6963], [73.5318, 51.5014],
@@ -2008,7 +2019,9 @@ def _persons_path() -> Path:
 _PERSONS_MEM: dict | None = None  # 内存缓存：匹配循环不再反复读盘
 
 def _load_persons() -> dict:
-    """加载全局人物库（内存缓存 + 磁盘）。自动迁移旧版本到 v4。"""
+    """加载全局人物库（内存缓存 + 磁盘）。自动迁移旧版本到 v4。
+    识别模型更换（_RECOG_MODEL 变化）时：embedding 空间不兼容，
+    备份旧库后重建空库（保留 model 标记），提示用户重新聚类。"""
     global _PERSONS_MEM
     with _persons_lock:
         if _PERSONS_MEM is not None:
@@ -2029,12 +2042,28 @@ def _load_persons() -> dict:
                 except Exception:
                     data = None
         if data is None or not isinstance(data, dict) or 'persons' not in data:
-            data = {'version': _PERSONS_VERSION, 'persons': {}, 'next_id': 1}
+            data = {'version': _PERSONS_VERSION, 'model': _RECOG_MODEL, 'persons': {}, 'next_id': 1}
         ver = int(data.get('version', 1))
+        orig_model = data.get('model')
         if ver < 3:
             data = _migrate_persons_v3(data)
         if int(data.get('version', 1)) < 4:
             data = _migrate_persons_v4(data)
+        # 迁移函数重建 dict 会丢掉 model 字段，补回（否则误判"换模型"触发重建）
+        if 'model' not in data and orig_model is not None:
+            data['model'] = orig_model
+        # 识别模型不匹配（换模型后 embedding 空间不同，旧向量无法匹配）
+        if data.get('model') != _RECOG_MODEL:
+            had_persons = bool(data.get('persons'))
+            try:
+                backup = p.with_name(f"persons_backup_{data.get('model') or 'old'}_{datetime.now():%Y%m%d_%H%M%S}.json")
+                backup.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+            except Exception:
+                pass
+            if had_persons:
+                print(f"  >> 识别模型已更换为 {_RECOG_MODEL}（原 {data.get('model')}）："
+                      f"人物库 embedding 不兼容，已备份旧库并重建，请重新聚类/命名")
+            data = {'version': _PERSONS_VERSION, 'model': _RECOG_MODEL, 'persons': {}, 'next_id': 1}
         _PERSONS_MEM = data
         return data
 
@@ -2068,15 +2097,17 @@ def _migrate_persons_v3(data: dict) -> dict:
     return out
 
 def _save_persons(persons: dict) -> None:
-    """原子写入全局人物库（v4），并同步内存缓存。"""
+    """原子写入全局人物库（v4，带识别模型标记），并同步内存缓存。"""
     global _PERSONS_MEM
     with _persons_lock:
-        _PERSONS_MEM = persons
+        data = dict(persons)
+        data['model'] = _RECOG_MODEL
+        _PERSONS_MEM = data
         p = _persons_path()
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix('.json.tmp')
-            tmp.write_text(json.dumps(persons, ensure_ascii=False), encoding='utf-8')
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
             os.replace(tmp, p)
         except Exception:
             pass
@@ -2713,11 +2744,12 @@ def _compute_merge_suggestions() -> list:
 #       小簇（<3 张脸，多为路人/模糊脸）不建人物 → 簇质心与全局 confirmed 人物 prototype 匹配 →
 #       sim≥0.55 自动归并 / 0.45~0.55 待确认候选(merge_pending) / <0.45 新建未确认人物。
 
-_CLUSTER_DIST = 0.50       # HAC cosine 距离阈值（sim≥0.50 视为同一人）
+_CLUSTER_DIST = 0.62       # HAC cosine 距离阈值（sim≥0.38 视为同一人；buffalo_l 类内更紧凑，
+                           # 放宽边界以减少同人拆成多簇——用户报告"几个人拆出几十个"）
 _MIN_CLUSTER = 3           # 簇最小脸数（小于则视为路人，不建人物）
-_AUTO_MERGE_SIM = 0.55     # 簇质心与全局 confirmed 人物 ≥ 此值 → 自动归并
-_PENDING_SIM = 0.45        # ≥ 此值但 < AUTO → 待确认候选
-_PENDING_DEDUP_SIM = 0.52  # 未确认人物跨文件夹去重阈值（同人复用既有待确认簇，避免泛滥）
+_AUTO_MERGE_SIM = 0.50     # 簇质心与全局 confirmed 人物 ≥ 此值 → 自动归并
+_PENDING_SIM = 0.42        # ≥ 此值但 < AUTO → 待确认候选
+_PENDING_DEDUP_SIM = 0.48  # 未确认人物跨文件夹去重阈值（同人复用既有待确认簇，避免泛滥）
 
 _FACE_MIN_DET = 0.20    # 聚类用：脸检测置信度下限（过滤误检）
 _FACE_MIN_AREA = 0.004  # 聚类用：脸占图像面积下限（过滤背景路人/极小脸）
