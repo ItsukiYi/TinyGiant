@@ -1452,6 +1452,53 @@ def test_build_album_index_discovers_photo_folders(tmp_path):
     assert b['persons'] == [3] and b['roles'] == [1]
 
 
+def test_album_sort_key_numeric():
+    """相册按文件夹名前缀数字（时间）自然排序：26.1 < 26.2 < ... < 26.10 < 26.11。"""
+    from pathlib import Path
+    names = ['26.11上海', '26.1元旦', '26.10十月', '26.2二月', '26.9九月', '无前缀相册']
+    paths = [Path(n) for n in names]
+    ordered = sorted(paths, key=P._album_sort_key)
+    got = [p.name for p in ordered]
+    assert got == ['26.1元旦', '26.2二月', '26.9九月', '26.10十月', '26.11上海', '无前缀相册']
+    # 年月日 vs 年月：26.9.12 排序在 26.9 之后、26.10 之前
+    assert P._album_sort_key(Path('26.9.12上海')) < P._album_sort_key(Path('26.10.1测试'))
+    assert P._album_sort_key(Path('26.9')) < P._album_sort_key(Path('26.9.12'))
+
+
+def test_build_album_index_sorts_by_time_prefix(tmp_path):
+    """索引顺序按时间自然排序（字符串排序会导致 26.10 排在 26.2 前，应修复）。"""
+    root = tmp_path / 'sorted_root'
+    for n in ('26.1-a', '26.2-b', '26.10-c', '26.11-d', '26.9-e'):
+        d = root / n; d.mkdir(parents=True)
+        _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    albums = P._build_album_index(root)
+    names = [a['name'] for a in albums]
+    assert names == ['26.1-a', '26.2-b', '26.9-e', '26.10-c', '26.11-d']
+
+
+def test_build_album_index_cover_fallback_after_rename(tmp_path):
+    """归档/整理重命名后 state.json 里的旧绝对路径失效 → 封面回退重新扫描，不消失。"""
+    root = tmp_path / 'rename_root'
+    a = root / '26.3节日'; a.mkdir(parents=True)
+    _make_jpg(a / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    _make_jpg(a / 'DSC0002.jpg', '2024:01:01 10:00:05')
+    (a / '_tg_cache').mkdir()
+    # 模拟重命名后 state.json 仍存旧绝对路径（路径已失效）
+    (a / '_tg_cache' / 'state.json').write_text(
+        json.dumps({'photos': {str(a / 'DSC0001.jpg'): {'keep': True},
+                               str(a / 'DSC0002.jpg'): {'keep': True}}}),
+        encoding='utf-8')
+    # 归档/整理后文件夹改名（照片文件还在，state.json 里的路径变旧）
+    a.rename(root / '26.3节日_archive')
+    albums = P._build_album_index(root)
+    assert len(albums) == 1
+    al = albums[0]
+    assert al['photo_count'] == 2
+    # 封面必须指向真实存在的文件（存在 → 前端能显示封面）
+    assert Path(al['cover_path']).exists()
+    assert al['cover_path'].endswith('.jpg')
+
+
 def test_archive_roundtrip(tmp_path, monkeypatch):
     """相册状态读写往返 + 内存缓存同步 + 旧格式兼容。"""
     monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')

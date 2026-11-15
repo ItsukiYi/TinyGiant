@@ -2473,14 +2473,32 @@ def _is_album_root(path: Path) -> bool:
                 return True
     return False
 
+# 相册文件夹名前缀数字段（年.月.日 / 年-月-日），用于自然排序与日期显示
+_NUM_PREFIX_RE = re.compile(r'^(\d+)(?:[.\-](\d+))?(?:[.\-](\d+))?')
+
+def _album_sort_key(path: Path):
+    """按文件夹名前缀数字自然排序：26.1 < 26.2 < ... < 26.10 < 26.11。
+    无数字前缀的目录按名字排最后。返回 (0, [y,m,d]) 或 (1, [name])。"""
+    m = _NUM_PREFIX_RE.match(path.name)
+    if m:
+        return (0, [int(g) for g in m.groups() if g])
+    return (1, [path.name])
+
+def _album_date_str(name: str) -> str:
+    """取文件夹名前缀数字段作日期（26.9.12上海... → '26.9.12'）；无则回退旧逻辑。"""
+    m = _NUM_PREFIX_RE.match(name)
+    if m:
+        return m.group(0)
+    return name.split(' ')[0] if ' ' in name else name[:10]
+
 def _build_album_index(root: Path) -> list:
     """遍历 root 下的子目录，构建相册索引。
     有 _tg_cache/state.json 的读元数据；未扫过的目录快速直扫（计数+封面）。
-    跳过不含照片的目录。"""
+    跳过不含照片的目录。按文件夹名前缀数字（时间）自然排序。"""
     import time as _t
     folder_states = _load_folder_states()
     albums = []
-    for d in sorted(root.iterdir()):
+    for d in sorted(root.iterdir(), key=_album_sort_key):
         if not d.is_dir() or d.name.startswith('_') or d.name.startswith('.') or d.name in SKIP_DIRS:
             continue
         state_path = d / '_tg_cache' / 'state.json'
@@ -2488,7 +2506,7 @@ def _build_album_index(root: Path) -> list:
         cover_path = ''
         persons = set()
         roles = set()
-        date_str = d.name.split(' ')[0] if ' ' in d.name else d.name[:10]
+        date_str = _album_date_str(d.name)
         if state_path.exists():
             try:
                 state = json.loads(state_path.read_text(encoding='utf-8'))
@@ -2511,6 +2529,13 @@ def _build_album_index(root: Path) -> list:
                     date_str = ts.strftime('%Y-%m-%d')
                 except OSError:
                     pass
+        elif cover_path and not Path(cover_path).exists():
+            # 封面路径失效（如归档/整理重命名文件夹后 state.json 里的
+            # 照片绝对路径已过时）：重新扫描找封面，避免封面图消失
+            try:
+                _, cover_path = _album_count_and_cover(d)
+            except Exception:
+                pass
         if photo_count == 0:
             continue  # 非照片文件夹，跳过
         albums.append({
