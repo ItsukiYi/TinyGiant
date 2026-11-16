@@ -1558,10 +1558,73 @@ def test_archive_roundtrip(tmp_path, monkeypatch):
     assert P._load_folder_states() == {str((tmp_path / 'a').resolve()): 'archived',
                                        str((tmp_path / 'b').resolve()): 'tidied'}
     # 兼容旧格式（v1 只有 archived 列表）
-    p = _archived_path_mock = tmp_path / 'archived.json'
+    p = tmp_path / 'archived.json'
     p.write_text('{"archived": ["%s"]}' % str((tmp_path / 'c').resolve()).replace('\\', '\\\\'), encoding='utf-8')
     P._FOLDER_STATES_MEM = None
     assert P._load_folder_states() == {str((tmp_path / 'c').resolve()): 'archived'}
+
+
+def test_pregen_mode_default_and_should_pregen(tmp_path, monkeypatch):
+    """缩略图预加载：auto 下无标记相册自动、tidied/archived 不自动；on/off 强制覆盖。"""
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    P._FOLDER_STATES_MEM = None
+    assert P._load_pregen_mode() == 'auto'
+    plain = tmp_path / '普通相册'
+    tidied = tmp_path / '已整理_tidied'
+    archived = tmp_path / '已归档_archive'
+    for d in (plain, tidied, archived):
+        d.mkdir(exist_ok=True)
+    # 注册状态（_should_pregen 按用户标记的状态判断，不看目录名）
+    P._save_folder_states({str(tidied.resolve()): 'tidied',
+                           str(archived.resolve()): 'archived'})
+    # auto：按状态
+    assert P._should_pregen(str(plain)) is True
+    assert P._should_pregen(str(tidied)) is False
+    assert P._should_pregen(str(archived)) is False
+    # on/off 强制覆盖
+    P._save_pregen_mode('off')
+    assert P._should_pregen(str(plain)) is False
+    P._save_pregen_mode('on')
+    assert P._should_pregen(str(archived)) is True
+    P._save_pregen_mode('auto')
+    assert P._should_pregen(str(plain)) is True
+
+
+def test_api_pregen_toggle(tmp_path, monkeypatch):
+    """api_pregen 设置模式并返回。"""
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    captured = {}
+    h = _fake_handler(captured)
+    h.api_pregen({'mode': 'off'})
+    assert captured['ok'] is True and captured['mode'] == 'off'
+    captured.clear()
+    h.api_pregen({'mode': 'bad'})
+    assert captured['ok'] is False
+    assert P._load_pregen_mode() == 'off'
+
+
+def test_api_score_tasks_split(tmp_path, monkeypatch):
+    """评分与分类开关分开：tasks 子集只执行对应步骤。"""
+    d = tmp_path / 'alb_t'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    monkeypatch.setattr(P, 'groups', [[P.Photo(d / 'DSC0001.jpg')]])
+    monkeypatch.setattr(P, 'scan_root', str(d))
+    calls = {'pregen': 0, 'subburst': 0, 'persons': 0, 'score': 0, 'roles': 0}
+    import threading, time
+    monkeypatch.setattr(P, 'pregenerate_cache', lambda *a, **k: calls.__setitem__('pregen', calls['pregen'] + 1))
+    monkeypatch.setattr(P, 'compute_subbursts', lambda *a, **k: calls.__setitem__('subburst', calls['subburst'] + 1))
+    monkeypatch.setattr(P, 'compute_persons', lambda *a, **k: calls.__setitem__('persons', calls['persons'] + 1))
+    monkeypatch.setattr(P, 'score_groups', lambda *a, **k: calls.__setitem__('score', calls['score'] + 1))
+    monkeypatch.setattr(P, 'compute_roles', lambda *a, **k: calls.__setitem__('roles', calls['roles'] + 1))
+    # 只勾"质量评分"：应只跑 cache+subburst+score，不跑 persons/roles
+    captured = {}
+    _fake_handler(captured).api_score({'dims': ['sharp'], 'tasks': ['cache', 'score']})
+    assert captured.get('ok') is True
+    assert calls['pregen'] == 1 and calls['subburst'] == 1 and calls['score'] == 1
+    assert calls['persons'] == 0 and calls['roles'] == 0
+    # 等后台线程完成再断言（persons/roles 不会异步出现）
+    time.sleep(0.1)
+    assert calls['persons'] == 0 and calls['roles'] == 0
 
 
 def test_build_album_index_marks_state(tmp_path, monkeypatch):

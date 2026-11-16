@@ -2360,11 +2360,56 @@ def _save_folder_states(states: dict) -> None:
         p = _archived_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps({'version': 2, 'archived': archived, 'tidied': tidied},
+        tmp.write_text(json.dumps({'version': 2, 'archived': archived, 'tidied': tidied,
+                                   'pregen': _load_pregen_mode()},
                                   ensure_ascii=False), encoding='utf-8')
         os.replace(tmp, p)
     except Exception:
         pass
+
+# ── 缩略图预加载模式（全局开关）────────────────────────
+# 'auto' = 按相册状态：无标记自动预生成；tidied/archived 不预生成
+# 'on'   = 始终自动预生成；'off' = 从不自动预生成
+# 用户可在界面手动切换；存 archived.json 的 pregen 字段。
+def _load_pregen_mode() -> str:
+    """当前缩略图预加载模式（'auto'|'on'|'off'），默认 auto。"""
+    try:
+        p = _archived_path()
+        if p.exists():
+            mode = json.loads(p.read_text(encoding='utf-8')).get('pregen')
+            if mode in ('auto', 'on', 'off'):
+                return mode
+    except Exception:
+        pass
+    return 'auto'
+
+def _save_pregen_mode(mode: str) -> None:
+    """保存缩略图预加载模式。"""
+    if mode not in ('auto', 'on', 'off'):
+        return
+    try:
+        p = _archived_path()
+        d = {}
+        if p.exists():
+            d = json.loads(p.read_text(encoding='utf-8'))
+        d['pregen'] = mode
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+def _should_pregen(folder_path: str) -> bool:
+    """该相册是否应自动预生成缩略图：全局开关 + 相册状态默认。"""
+    mode = _load_pregen_mode()
+    if mode == 'on':
+        return True
+    if mode == 'off':
+        return False
+    # auto：有整理/归档标记的相册不再自动预加载缩略图
+    state = _load_folder_states().get(str(Path(folder_path).resolve()), '')
+    return state not in ('tidied', 'archived')
 
 def _purge_preview_full(root: Path) -> int:
     """删除相册 _tg_cache 下的全分辨率预览缓存（preview_full_*.jpg 及 .sig）。
@@ -3007,6 +3052,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path == '/api/export':   return self.api_export(body)
             if p.path == '/api/albums':   return self.api_albums(body)
             if p.path == '/api/archive':  return self.api_archive(body)
+            if p.path == '/api/pregen':   return self.api_pregen(body)
             if p.path == '/api/reassign':  return self.api_reassign(body)
             if p.path == '/api/assign_role': return self.api_assign_role(body)
             if p.path == '/api/score':     return self.api_score(body)
@@ -3134,6 +3180,7 @@ class Handler(BaseHTTPRequestHandler):
                     'dir': current_dir, 'view': 'albums',
                     'roots': rlist, 'albums': albums,
                     'persons': persons, 'roles': roles,
+                    'pregen_mode': _load_pregen_mode(),
                 })
         except Exception:
             import traceback; traceback.print_exc()
@@ -3174,6 +3221,7 @@ class Handler(BaseHTTPRequestHandler):
             'dir': current_dir,
             'groups': [[p.to_dict() for p in g] for g in snap],
             'persons': persons, 'roles': roles, 'group_photos': groups_list,
+            'pregen_mode': _load_pregen_mode(),
         })
 
     # ── 调试：返回人脸框和骨架数据 ─────────────────
@@ -3513,35 +3561,39 @@ class Handler(BaseHTTPRequestHandler):
             groups = result
             rebuild_photo_list()
         _set_gen_pause(False)  # 新相册浏览开始：恢复图片生成请求
-        # 后台自动预生成缩略图（可打断）：新相册 1000+ 张 HIF 打开即预热，
-        # 用户浏览时缩略图秒开；点主页/开其他相册时通过代次提前停止。
-        # 关键：代次必须在启动线程前固定（my_gen），否则线程调度延迟期间
-        # 用户已 bump（点主页），线程内再 take() 会取到新代次 → 预生成永不失效。
-        try:
-            root_s = str(Path(scan_root).resolve())
-            photos_flat = [p for g in groups for p in g]
-            pregen_gen = my_gen
-            def _bg_pregen():
-                try:
-                    pregenerate_cache(root_s, photos_flat, gen=pregen_gen)
-                except Exception as e:
-                    print(f"  >> 后台缩略图预生成异常: {e}")
-            threading.Thread(target=_bg_pregen, daemon=True).start()
-        except Exception:
-            pass
+        # 后台自动预生成缩略图（可打断）：仅无整理/归档标记的相册默认预热，
+        # tidied/archived 相册不自动加载（省资源）；全局开关可覆盖（_should_pregen）。
+        # 代次必须在启动线程前固定（my_gen），否则线程调度延迟期间用户已 bump。
+        if _should_pregen(directory):
+            try:
+                root_s = str(Path(scan_root).resolve())
+                photos_flat = [p for g in groups for p in g]
+                pregen_gen = my_gen
+                def _bg_pregen():
+                    try:
+                        pregenerate_cache(root_s, photos_flat, gen=pregen_gen)
+                    except Exception as e:
+                        print(f"  >> 后台缩略图预生成异常: {e}")
+                threading.Thread(target=_bg_pregen, daemon=True).start()
+            except Exception:
+                pass
         self._json({
             'ok': True,
             'dir': current_dir, 'view': 'photos',
             'groups': [[p.to_dict() for p in g] for g in groups] if groups else [],
+            'pregen_mode': _load_pregen_mode(),
         })
 
     def api_score(self, body):
-        """手动触发评分（缓存+评分+人物批量聚类+角色归类）。
-        body.dims: 参与评分的维度子集（sharp/face/exp/contrast），缺省全开。
-        人物识别为文件夹内批量聚类 + 全局质心匹配（compute_persons）。"""
+        """手动触发评分/分类。tasks 控制执行内容（可独立开关）：
+        'cache'   缩略图/预览缓存预热
+        'score'   连拍分组 + 质量评分（清晰度/曝光/对比度/人脸）
+        'persons' 人物识别聚类（compute_persons）
+        'roles'   角色自动归类
+        缺省执行全部。body.dims 限定评分维度子集。"""
         global scoring_busy
         if scoring_busy:
-            return self._json({'ok': False, 'error': '评分进行中'})
+            return self._json({'ok': False, 'error': '任务进行中'})
         if not groups:
             return self._json({'ok': False, 'error': '没有照片'})
         # 校验 dims：只保留合法维度，空则默认全开
@@ -3549,31 +3601,45 @@ class Handler(BaseHTTPRequestHandler):
         dims = [d for d in raw_dims if d in _ALL_DIMS]
         if not dims:
             dims = list(_ALL_DIMS)
+        # 任务开关：缺省全部
+        raw_tasks = body.get('tasks') or ['cache', 'score', 'persons', 'roles']
+        tasks = set(t for t in raw_tasks if t in ('cache', 'score', 'persons', 'roles'))
+        if not tasks:
+            return self._json({'ok': False, 'error': '至少选择一个任务（cache/score/persons/roles）'})
+        run_cache = 'cache' in tasks
+        run_score = 'score' in tasks
+        run_persons = 'persons' in tasks
+        run_roles = 'roles' in tasks
         scoring_busy = True
         root_s = str(Path(scan_root).resolve()) if scan_root else ''
         photos_flat = [p for g in groups for p in g]
-        # 代次在主线程固定：用户点评分后立即点主页，评分线程启动前 bump 已发生，
-        # 线程内再 take() 会取到新代次导致评分永不失效。
+        # 代次在主线程固定：用户触发后立即点主页，线程启动前 bump 已发生，
+        # 线程内再 take() 会取到新代次导致任务永不失效。
         score_gen = _scan_gen_take()
         def _bg_score():
             global scoring_busy
             my_gen = score_gen
             try:
-                pregenerate_cache(root_s, photos_flat, gen=my_gen)
-                if _scan_gen_stale(my_gen): return
-                compute_subbursts(root_s, groups)
-                if _scan_gen_stale(my_gen): return
-                compute_persons(root_s, groups)          # 批量聚类人物 + 全局质心匹配
-                if _scan_gen_stale(my_gen): return
-                score_groups(root_s, groups, dims=dims)  # 质量评分（闭眼基线用 person_id）
-                if _scan_gen_stale(my_gen): return
-                compute_roles(root_s, groups)
+                if run_cache:
+                    pregenerate_cache(root_s, photos_flat, gen=my_gen)
+                if run_score:
+                    if _scan_gen_stale(my_gen): return
+                    compute_subbursts(root_s, groups)
+                if run_persons:
+                    if _scan_gen_stale(my_gen): return
+                    compute_persons(root_s, groups)          # 批量聚类人物 + 全局质心匹配
+                if run_score:
+                    if _scan_gen_stale(my_gen): return
+                    score_groups(root_s, groups, dims=dims)  # 质量评分（闭眼基线用 person_id）
+                if run_roles:
+                    if _scan_gen_stale(my_gen): return
+                    compute_roles(root_s, groups)
             except Exception as e:
-                print(f"  >> 后台评分异常: {e}")
+                print(f"  >> 后台任务异常: {e}")
             finally:
                 scoring_busy = False
         threading.Thread(target=_bg_score, daemon=True).start()
-        self._json({'ok': True, 'dims': dims})
+        self._json({'ok': True, 'dims': dims, 'tasks': sorted(tasks)})
 
     def _get_local_person_embeddings(self, local_pid: int) -> list:
         """取某未确认人物（局部 person）在本文件夹内的代表 embedding。
@@ -3773,6 +3839,16 @@ class Handler(BaseHTTPRequestHandler):
         albums = _rebuild_albums(_load_roots())
         _save_album_cache(albums)
         return self._json({'ok': True, 'states': states, 'albums': albums})
+
+    def api_pregen(self, body):
+        """POST /api/pregen {mode} → 设置缩略图预加载模式（全局开关）。
+        'auto'：按相册状态（无标记自动；tidied/archived 不自动）
+        'on'/'off'：始终/从不自动预生成。返回当前模式。"""
+        mode = body.get('mode', '')
+        if mode not in ('auto', 'on', 'off'):
+            return self._json({'ok': False, 'error': '未知模式: ' + str(mode)})
+        _save_pregen_mode(mode)
+        return self._json({'ok': True, 'mode': mode})
 
     def api_export(self, body):
         import shutil, datetime as dt
@@ -4026,6 +4102,8 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
         <button class="mi" id="filterBtn" onclick="toggleFilterPanel()"><span class="chk"></span>筛选…</button>
         <button class="mi" id="labelBtn" onclick="toggleLabel()"><span class="chk" id="labelChk"></span>标注模式</button>
         <div class="mi-sep"></div>
+        <button class="mi" id="pregenBtn" onclick="cyclePregen()" title="缩略图预加载：自动=无标记相册加载、已整理/已归档不加载；开/关=强制全局">缩略图:自动</button>
+        <div class="mi-sep"></div>
         <button class="mi" id="debugBtn" onclick="toggleDebug()"><span class="chk" id="debugChk"></span>调试</button>
         <button class="mi" id="logBtn" onclick="toggleLog()"><span class="chk" id="logChk"></span>日志</button>
       </div>
@@ -4096,16 +4174,20 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 
 <!-- 评分配置面板 -->
 <div class="modal" id="scorePanel">
-  <div class="mc" style="max-width:380px">
-    <h2>⚙️ 评分配置</h2>
-    <p style="color:#888;font-size:12px">选择参与评分的维度（未勾选的不计入总分）</p>
+  <div class="mc" style="max-width:400px">
+    <h2>⚙️ 评分与分类</h2>
+    <p style="color:#888;font-size:12px">执行内容（可独立开关）</p>
+    <label><input type="checkbox" id="taskScore" checked onchange="updateScoreTasks()"> 质量评分（连拍分组 + 清晰度/曝光/对比度/人脸）</label><br>
+    <label><input type="checkbox" id="taskPersons" checked onchange="updateScoreTasks()"> 人物分类（聚类识别 + 角色归类）</label>
+    <hr style="border:none;border-top:1px solid #333;margin:10px 0">
+    <p style="color:#888;font-size:12px">评分维度（仅质量评分时生效）</p>
     <label><input type="checkbox" id="dimSharp" checked onchange="updateScoreDims()"> 对焦/清晰度</label><br>
     <label><input type="checkbox" id="dimFace" checked onchange="updateScoreDims()"> 表情/人脸</label><br>
     <label><input type="checkbox" id="dimExp" checked onchange="updateScoreDims()"> 曝光</label><br>
     <label><input type="checkbox" id="dimContrast" checked onchange="updateScoreDims()"> 对比度</label>
     <div class="ma">
       <button class="btn btn-cancel" onclick="closeScorePanel()">取消</button>
-      <button class="btn" style="background:#e67e22;color:#fff" onclick="confirmScoring()">确认开始评分</button>
+      <button class="btn" style="background:#e67e22;color:#fff" onclick="confirmScoring()">确认开始</button>
     </div>
   </div>
 </div>
@@ -4177,7 +4259,25 @@ async function load(v){const u=v==='albums'?'/api/data?view=albums':'/api/data';
   DATA=d;
   VIEW=d.view==='albums'?'albums':(d.view==='setup'?'setup':'photos');
   if(VIEW==='albums') ALBUM_ROOT=DATA.dir;
+  if(d.pregen_mode) window._pregenMode=d.pregen_mode;
+  updatePregenBtn();
   render();updateButtons();updRootCnt()}
+function updatePregenBtn(){
+  const b=document.getElementById('pregenBtn');if(!b)return;
+  const m=window._pregenMode||'auto';
+  b.textContent=m==='auto'?'缩略图:自动':(m==='on'?'缩略图:开':'缩略图:关');
+}
+async function cyclePregen(){
+  const modes=['auto','on','off'];
+  const cur=window._pregenMode||'auto';
+  const nx=modes[(modes.indexOf(cur)+1)%3];
+  try{
+    const r=await fetch('/api/pregen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:nx})});
+    const d=await r.json();
+    if(d.ok){window._pregenMode=d.mode;updatePregenBtn()}
+    else alert('操作失败: '+d.error)
+  }catch(e){alert('请求失败: '+e.message)}
+}
 function updRootCnt(){const rc=document.getElementById('albumRootCnt');if(rc)rc.textContent=(DATA.roots||[]).length?('· '+(DATA.roots||[]).length):''}
 function render(){
   if(VIEW==='setup'){renderSetup();return updateButtons()}
@@ -4668,10 +4768,15 @@ function openScorePanel(){
     document.getElementById('dimExp').checked=window._scoreDims.includes('exp');
     document.getElementById('dimContrast').checked=window._scoreDims.includes('contrast');
   }
+  if(window._scoreTasks){
+    document.getElementById('taskScore').checked=window._scoreTasks.includes('score');
+    document.getElementById('taskPersons').checked=window._scoreTasks.includes('persons');
+  }
   document.getElementById('scorePanel').classList.add('on');
 }
 function closeScorePanel(){document.getElementById('scorePanel').classList.remove('on')}
 function updateScoreDims(){/* 占位，无需实时动作 */}
+function updateScoreTasks(){/* 占位，无需实时动作 */}
 function getSelectedDims(){
   const d=[];
   if(document.getElementById('dimSharp').checked)d.push('sharp');
@@ -4680,15 +4785,24 @@ function getSelectedDims(){
   if(document.getElementById('dimContrast').checked)d.push('contrast');
   return d;
 }
+function getSelectedTasks(){
+  const t=[];
+  if(document.getElementById('taskScore').checked)t.push('cache','score');
+  if(document.getElementById('taskPersons').checked)t.push('persons','roles');
+  return t;
+}
 async function confirmScoring(){
   const dims=getSelectedDims();
+  const tasks=getSelectedTasks();
   if(!dims.length){alert('请至少选择一个评分维度');return}
+  if(!tasks.length){alert('请至少选择一项执行内容（质量评分 / 人物分类）');return}
   window._scoreDims=dims;
+  window._scoreTasks=tasks;
   closeScorePanel();
   try{
-    const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dims:dims})});
+    const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dims:dims,tasks:tasks})});
     const d=await r.json();
-    if(!d.ok){alert('评分启动失败: '+d.error);return}
+    if(!d.ok){alert('任务启动失败: '+d.error);return}
     pollScores()
   }catch(e){alert('评分失败: '+e.message)}
 }
