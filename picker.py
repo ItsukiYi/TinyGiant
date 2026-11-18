@@ -5123,7 +5123,7 @@ function _passTagFilter(p){
 async function startScoring(){openScorePanel()}
 
 // ── 统一任务进度条（任务名 + 阶段说明 + 进度 + trace 首行）──
-let _taskTimer=null, _taskPending=false, _taskPendTs=0;
+let _taskTimer=null, _taskPending=false, _taskPendTs=0, _taskPendBaseId=0, _taskLastId=0;
 function _tb(id){return document.getElementById(id)}
 function _taskShow(){const b=_tb('taskBar');if(b)b.classList.add('on')}
 function _taskHide(){const b=_tb('taskBar');if(b)b.classList.remove('on')}
@@ -5145,15 +5145,20 @@ function _taskRender(t){
     else {fill.classList.remove('indet');fill.style.width='100%'}
   }
 }
-// 本地"请求已发出、后端任务还没出现"的等待态（如扫描刚点击）
-function taskPend(label){
-  _taskPending=true;_taskPendTs=Date.now();
+// 仅渲染"等待态"（不重置计时，供轮询时重复调用）
+function _taskPendRender(label){
   _taskShow();
   if(_tb('tbName'))_tb('tbName').textContent=label||'加载中…';
   if(_tb('tbPhase'))_tb('tbPhase').textContent='';
   if(_tb('tbCount'))_tb('tbCount').textContent='';
   if(_tb('tbHead'))_tb('tbHead').textContent='';
   const f=_tb('tbFill');if(f){f.classList.add('indet');f.style.width=''}
+}
+// 本地"请求已发出、后端任务还没出现"的等待态（如扫描刚点击）。
+// 注意：这里才重置计时与基线任务 id；轮询内部只能用 _taskPendRender。
+function taskPend(label){
+  _taskPending=true;_taskPendTs=Date.now();_taskPendBaseId=_taskLastId;
+  _taskPendRender(label);
 }
 // 轮询后端任务状态；任务结束后 1.2s 自动隐藏
 function pollTask(){
@@ -5162,10 +5167,13 @@ function pollTask(){
     let idle=0;
     _taskTimer=setInterval(async()=>{
       let t;try{t=await(await fetch('/api/task')).json()}catch(e){return}
+      const newTask = t.id !== _taskPendBaseId;  // 后端已开过新任务（或已完成）
+      _taskLastId = t.id;
       if(!t.done){_taskPending=false;idle=0;taskRender(t);return}
-      // 后端任务已结束：若还在本地等待窗口内，保持不确定进度条（等真任务开始）
-      if(_taskPending && Date.now()-_taskPendTs<8000){
-        idle=0;taskPend(_tb('tbName')?_tb('tbName').textContent:'加载中…');return
+      // 后端任务已结束：仅当"等待窗口内且后端仍是旧任务"才保持等待态，
+      // 一旦后端任务 id 变化（新任务开始/结束）立即结束等待，避免一直卡"扫描目录…"
+      if(_taskPending && !newTask && Date.now()-_taskPendTs<3000){
+        idle=0;_taskPendRender(_tb('tbName')?_tb('tbName').textContent:'加载中…');return
       }
       _taskPending=false;
       taskRender(t);
