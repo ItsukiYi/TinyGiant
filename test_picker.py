@@ -1700,6 +1700,67 @@ def test_api_archive_archived_purges_preview_full(tmp_path, monkeypatch):
     assert (root / 'album_a').exists()
 
 
+def test_migrate_album_paths(tmp_path):
+    """文件夹重命名后迁移 state/faces/dates 键与缓存文件名（保人物归属/选择/缩略图）。"""
+    old = tmp_path / '相册'; old.mkdir()
+    cache = old / '_tg_cache'; cache.mkdir()
+    photo_old = str((old / 'DSC0001.jpg').resolve())
+    # state.json（人物归属 + 选择）
+    (cache / 'state.json').write_text(json.dumps({'version': 1, 'photos': {
+        photo_old: {'keep': True, 'person_id': 7, 'role_id': 2, 'score': 88}}}), encoding='utf-8')
+    (cache / 'faces.json').write_text(json.dumps({'version': 2, 'model': P._RECOG_MODEL, 'faces': {
+        photo_old: {'sig': 'a|1', 'faces': []}}}), encoding='utf-8')
+    (cache / 'dates.json').write_text(json.dumps({photo_old: {'sig': 'a|1', 'dt': '2024-01-01T10:00:00'}}),
+                                      encoding='utf-8')
+    # 旧路径哈希命名的缩略图缓存
+    h_old = P._path_hash((old / 'DSC0001.jpg'))
+    (cache / f'thumb_{h_old}.jpg').write_bytes(b'thumb')
+    (cache / f'thumb_{h_old}.sig').write_text('a|1')
+    # 重命名文件夹
+    new = tmp_path / '相册_tidied'
+    old.rename(new)
+    stats = P._migrate_album_paths(old, new)
+    assert stats['state'] == 1 and stats['faces'] == 1 and stats['dates'] == 1
+    assert stats['cache'] == 2  # jpg + sig
+    cache2 = new / '_tg_cache'
+    photo_new = str((new / 'DSC0001.jpg').resolve())
+    st = json.loads((cache2 / 'state.json').read_text(encoding='utf-8'))
+    assert photo_new in st['photos']
+    assert st['photos'][photo_new]['person_id'] == 7      # 人物归属保留
+    assert st['photos'][photo_new]['keep'] is True         # 选择保留
+    assert photo_old not in st['photos']
+    fc = json.loads((cache2 / 'faces.json').read_text(encoding='utf-8'))
+    assert photo_new in fc['faces'] and photo_old not in fc['faces']
+    dc = json.loads((cache2 / 'dates.json').read_text(encoding='utf-8'))
+    assert photo_new in dc and photo_old not in dc
+    # 缩略图缓存改名为新哈希
+    h_new = P._path_hash((new / 'DSC0001.jpg'))
+    assert (cache2 / f'thumb_{h_new}.jpg').exists()
+    assert not (cache2 / f'thumb_{h_old}.jpg').exists()
+
+
+def test_api_archive_migrates_state(tmp_path, monkeypatch):
+    """通过 api_archive 设整理：state 里的 person_id 随重命名迁移，重新打开分类栏有数据。"""
+    root = _mk_album_root(tmp_path)
+    monkeypatch.setattr(P, '_archived_path', lambda: tmp_path / 'archived.json')
+    monkeypatch.setattr(P, '_load_roots', lambda: [str(root)])
+    P._FOLDER_STATES_MEM = None
+    alb = root / 'album_b'
+    # album_b 已有 state.json（含 person_id）
+    st_path = alb / '_tg_cache' / 'state.json'
+    photo = str((alb / 'DSC0001.jpg').resolve())
+    st_path.write_text(json.dumps({'photos': {photo: {'person_id': 9, 'keep': True}}}), encoding='utf-8')
+    captured = {}
+    _fake_handler(captured).api_archive({'path': str(alb.resolve()), 'state': 'tidied'})
+    assert captured['ok'] is True
+    new_alb = root / 'album_b_tidied'
+    assert new_alb.exists()
+    st2 = json.loads((new_alb / '_tg_cache' / 'state.json').read_text(encoding='utf-8'))
+    photo_new = str((new_alb / 'DSC0001.jpg').resolve())
+    assert photo_new in st2['photos']
+    assert st2['photos'][photo_new]['person_id'] == 9
+
+
 def test_api_archive_tidied_rejected_on_archived_folder(tmp_path, monkeypatch):
     """已归档（_archive 后缀）的文件夹设整理应被拒绝。"""
     root = _mk_album_root(tmp_path)
@@ -1821,6 +1882,57 @@ def test_api_scan_cancelled_does_not_publish(tmp_path, monkeypatch):
     _fake_handler(captured).api_scan({'directory': str(d)})
     assert captured.get('cancelled') is True
     assert P.groups == []  # 半成品未发布到全局
+
+
+def test_api_scan_returns_classification_bars(tmp_path, monkeypatch):
+    """重新打开相册（走 /api/scan）也必须返回 persons/roles/group_photos，
+    否则上方分类栏不显示（回归修复）。"""
+    fake = tmp_path / 'g'; fake.mkdir()
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    monkeypatch.setattr(P, '_roots_path', lambda: fake / 'roots.json')
+    monkeypatch.setattr(P, '_archived_path', lambda: fake / 'archived.json')
+    monkeypatch.setattr(P, 'scan_root', '')
+    monkeypatch.setattr(P, 'current_dir', '')
+    monkeypatch.setattr(P, 'groups', [])
+    monkeypatch.setattr(P, '_should_pregen', lambda _p: False)  # 不触发后台预生成
+    d = tmp_path / 'alb_c'; d.mkdir()
+    _make_jpg(d / 'DSC0001.jpg', '2024:01:01 10:00:00')
+    _make_jpg(d / 'DSC0002.jpg', '2024:01:01 10:00:05')
+    p1 = P.Photo(d / 'DSC0001.jpg'); p1.person_id = 1; p1.role_id = 2
+    p2 = P.Photo(d / 'DSC0002.jpg'); p2.person_id = 1
+    p2.is_group = True; p2.group_pids = [1, 3]
+    # 隔离人物库：注册 pid=1（命名）与 pid=3
+    P._PERSONS_MEM = None
+    P._save_persons({'version': 4, 'model': P._RECOG_MODEL, 'persons': {
+        '1': {'name': '花崎', 'confirmed': True, 'prototype': None, 'embeddings': []},
+        '3': {'name': '同伴', 'confirmed': True, 'prototype': None, 'embeddings': []},
+    }, 'next_id': 4})
+    monkeypatch.setattr(P, 'scan', lambda directory, **kw: [[p1, p2]])
+    captured = {}
+    _fake_handler(captured).api_scan({'directory': str(d)})
+    assert captured.get('ok') is True
+    # 分类栏数据齐全
+    assert [x['id'] for x in captured['persons']] == [1]
+    assert captured['persons'][0]['count'] == 2
+    assert captured['persons'][0]['name'] == '花崎'
+    assert [x['id'] for x in captured['roles']] == [2]
+    assert captured['group_photos']  # 合照聚合（含花崎/同伴的合照）
+    assert [g['pid'] for g in captured['group_photos']] == [1, 3]
+
+
+def test_photos_view_payload_matches_api_data(tmp_path, monkeypatch):
+    """api_scan 与 api_data 使用同一 payload 函数，字段集合一致。"""
+    fake = tmp_path / 'g2'; fake.mkdir()
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    monkeypatch.setattr(P, '_roots_path', lambda: fake / 'roots.json')
+    monkeypatch.setattr(P, 'current_dir', '/x')
+    p = P.Photo(tmp_path / 'a.jpg'); p.person_id = 5
+    payload = P._photos_view_payload([[p]])
+    assert payload['view'] == 'photos'
+    assert payload['dir'] == '/x'
+    assert 'persons' in payload and 'roles' in payload and 'group_photos' in payload
+    assert payload['persons'][0]['id'] == 5
+    assert isinstance(payload['groups'], list)
 
 
 def test_scan_os_walk_still_finds_photos(tmp_path):

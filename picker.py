@@ -2371,6 +2371,86 @@ def _save_folder_states(states: dict) -> None:
 # 'auto' = 按相册状态：无标记自动预生成；tidied/archived 不预生成
 # 'on'   = 始终自动预生成；'off' = 从不自动预生成
 # 用户可在界面手动切换；存 archived.json 的 pregen 字段。
+def _migrate_album_paths(old: Path, new: Path) -> dict:
+    """相册文件夹重命名后，把 _tg_cache 内的数据从旧路径前缀迁移到新路径前缀。
+    必须迁移（否则 state 失效 → 保留选择/评分/人物归属全部丢失、分类栏消失）：
+      - state.json  photos 键（照片绝对路径）
+      - faces.json  faces 键
+      - dates.json  键
+      - 缩略图/预览/封面缓存文件（按路径哈希命名）
+    返回迁移统计。"""
+    st = {'state': 0, 'faces': 0, 'dates': 0, 'cache': 0}
+    old_s, new_s = str(old), str(new)
+    cache = new / '_tg_cache'
+    if not cache.is_dir():
+        return st
+    old_new_photos = {}
+
+    def _mig(resolve_s: str) -> str:
+        return new_s + resolve_s[len(old_s):] if resolve_s.startswith(old_s) else resolve_s
+
+    def _mig_json(filename: str, container_key: str | None, stat_key: str) -> None:
+        p = cache / filename
+        if not p.exists():
+            return
+        try:
+            d = json.loads(p.read_text(encoding='utf-8'))
+            obj = d if container_key is None else d.get(container_key)
+            if not isinstance(obj, dict):
+                return
+            out, changed = {}, 0
+            for k, v in obj.items():
+                nk = _mig(k)
+                if nk != k:
+                    old_new_photos[k] = nk
+                    changed += 1
+                out[nk] = v
+            if not changed:
+                return
+            if container_key is None:
+                d = out
+            else:
+                d[container_key] = out
+            tmp = p.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(d, ensure_ascii=False), encoding='utf-8')
+            os.replace(tmp, p)
+            st[stat_key] = changed
+        except Exception:
+            pass
+
+    _mig_json('state.json', 'photos', 'state')
+    _mig_json('faces.json', 'faces', 'faces')
+    _mig_json('dates.json', None, 'dates')
+
+    # 缓存文件按新旧照片路径哈希重命名（thumb/preview/preview_full/封面）
+    seen = set()
+    for old_photo, new_photo in old_new_photos.items():
+        try:
+            h_old = _path_hash(Path(old_photo))
+            h_new = _path_hash(Path(new_photo))
+        except Exception:
+            continue
+        if h_old == h_new or h_old in seen:
+            continue
+        seen.add(h_old)
+        for pfx in ('thumb_', 'preview_', 'preview_full_', 'cov_'):
+            for ext in ('.jpg', '.sig'):
+                a = cache / f'{pfx}{h_old}{ext}'
+                if not a.exists():
+                    continue
+                b = cache / f'{pfx}{h_new}{ext}'
+                try:
+                    if b.exists():
+                        b.unlink()
+                    a.rename(b)
+                    st['cache'] += 1
+                except OSError:
+                    pass
+    if any(st.values()):
+        print(f"  > 文件夹重命名：已迁移 state {st['state']} / faces {st['faces']} / "
+              f"dates {st['dates']} / 缓存 {st['cache']} 项")
+    return st
+
 def _load_pregen_mode() -> str:
     """当前缩略图预加载模式（'auto'|'on'|'off'），默认 auto。"""
     try:
@@ -2977,6 +3057,47 @@ def compute_persons(root, groups) -> dict:
     print(f"  >> 人物聚类完成 ({_t.time()-t0:.1f}s: 自动归并{stats['auto']} 待确认{stats['pending']} 新建{stats['new']} 合照{stats['group']})")
     return stats
 
+def _photos_view_payload(snap: list, dir_str: str | None = None) -> dict:
+    """照片视图的完整响应载荷：groups + persons/roles/group_photos + pregen_mode。
+    api_data 与 api_scan 共用同一份组装逻辑——此前 api_scan 不返回 persons/roles，
+    导致从相册首页重新打开相册（走 scan）后上方分类栏不显示。"""
+    pcounts, rcounts = {}, {}
+    for g in snap:
+        for p in g:
+            if p.person_id is not None:
+                pcounts[p.person_id] = pcounts.get(p.person_id, 0) + 1
+            if p.role_id is not None:
+                rcounts[p.role_id] = rcounts.get(p.role_id, 0) + 1
+    persons_db = _load_persons().get('persons', {})
+    roles_db = _load_roles().get('roles', {})
+    # 人物：仅当前目录出现的（含本文件夹新聚类与命中的全局人物）
+    persons = [{'id': pid, 'count': pcounts.get(pid, 0), 'color': _person_color(pid),
+                'name': persons_db.get(str(pid), {}).get('name', ''),
+                'confirmed': persons_db.get(str(pid), {}).get('confirmed', False)}
+               for pid in sorted(pcounts.keys())]
+    # 合照类别："含xxx的合照"——合照中含某 coser，按 coser 聚合
+    group_counts = {}
+    for g in snap:
+        for p in g:
+            if p.is_group and p.group_pids:
+                for gpid in p.group_pids:
+                    group_counts[gpid] = group_counts.get(gpid, 0) + 1
+    groups_list = [{'pid': gpid, 'count': cnt,
+                    'name': '含' + (persons_db.get(str(gpid), {}).get('name', '') or ('人物' + str(gpid))) + '的合照',
+                    'color': _person_color(gpid)}
+                   for gpid, cnt in sorted(group_counts.items())]
+    # 角色：仅当前目录出现的
+    roles = [{'id': rid, 'count': rcounts.get(rid, 0), 'color': _person_color(rid + 100),
+              'name': roles_db.get(str(rid), {}).get('name', '')}
+             for rid in sorted(rcounts.keys())]
+    return {
+        'dir': current_dir if dir_str is None else dir_str,
+        'view': 'photos',
+        'groups': [[p.to_dict() for p in g] for g in snap],
+        'persons': persons, 'roles': roles, 'group_photos': groups_list,
+        'pregen_mode': _load_pregen_mode(),
+    }
+
 def get_photo_by_id(pid: int) -> Photo | None:
     return photo_dict.get(pid)
 
@@ -3186,43 +3307,8 @@ class Handler(BaseHTTPRequestHandler):
             import traceback; traceback.print_exc()
         with _state_lock:
             snap = [[p for p in g] for g in groups]
-        pcounts, rcounts = {}, {}
-        for g in snap:
-            for p in g:
-                if p.person_id is not None:
-                    pcounts[p.person_id] = pcounts.get(p.person_id, 0) + 1
-                if p.role_id is not None:
-                    rcounts[p.role_id] = rcounts.get(p.role_id, 0) + 1
-        persons_db = _load_persons().get('persons', {})
-        roles_db = _load_roles().get('roles', {})
-        # 人物：仅当前目录出现的（含本文件夹新聚类与命中的全局人物），不显示其他文件夹的人物
-        all_pids = set(pcounts.keys())
-        persons = [{'id': pid, 'count': pcounts.get(pid, 0), 'color': _person_color(pid),
-                    'name': persons_db.get(str(pid), {}).get('name', ''),
-                    'confirmed': persons_db.get(str(pid), {}).get('confirmed', False)}
-                   for pid in sorted(all_pids)]
-        # 合照类别："含xxx的合照"——合照中含某 coser，按 coser 聚合
-        group_counts = {}  # {pid: 合照数}
-        for g in snap:
-            for p in g:
-                if p.is_group and p.group_pids:
-                    for gpid in p.group_pids:
-                        group_counts[gpid] = group_counts.get(gpid, 0) + 1
-        groups_list = [{'pid': gpid, 'count': cnt,
-                        'name': '含' + (persons_db.get(str(gpid), {}).get('name', '') or ('人物' + str(gpid))) + '的合照',
-                        'color': _person_color(gpid)}
-                       for gpid, cnt in sorted(group_counts.items())]
-        # 角色：仅当前目录出现的（同样只显示本文件夹涉及的角色）
-        all_rids = set(rcounts.keys())
-        roles = [{'id': rid, 'count': rcounts.get(rid, 0), 'color': _person_color(rid + 100),
-                  'name': roles_db.get(str(rid), {}).get('name', '')}
-                 for rid in sorted(all_rids)]
-        self._json({
-            'dir': current_dir,
-            'groups': [[p.to_dict() for p in g] for g in snap],
-            'persons': persons, 'roles': roles, 'group_photos': groups_list,
-            'pregen_mode': _load_pregen_mode(),
-        })
+        payload = _photos_view_payload(snap)
+        self._json(payload)
 
     # ── 调试：返回人脸框和骨架数据 ─────────────────
     def api_debug_photo(self, photo_id):
@@ -3428,8 +3514,10 @@ class Handler(BaseHTTPRequestHandler):
             with _persons_lock:
                 persons = _load_persons()
                 pid = persons['next_id']
+                # 与 v4 人物结构统一：空 embeddings + 命名即确认（便于后续匹配/合并）
+                name = body.get('name', '') or ''
                 persons['persons'][str(pid)] = {'embeddings': [], 'count': 0,
-                    'exemplar': '', 'name': body.get('name', '')}
+                    'exemplar': '', 'name': name, 'confirmed': bool(name), 'prototype': None}
                 persons['next_id'] = pid + 1
                 _save_persons(persons)
             return self._json({'ok': True, 'id': pid})
@@ -3577,12 +3665,12 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_bg_pregen, daemon=True).start()
             except Exception:
                 pass
-        self._json({
-            'ok': True,
-            'dir': current_dir, 'view': 'photos',
-            'groups': [[p.to_dict() for p in g] for g in groups] if groups else [],
-            'pregen_mode': _load_pregen_mode(),
-        })
+        # 与 api_data 共用同一份载荷：包含 persons/roles/group_photos，
+        # 否则从相册首页打开相册后上方分类栏不显示（此前 api_scan 缺这些字段）。
+        with _state_lock:
+            snap = [[p for p in g] for g in groups]
+        payload = _photos_view_payload(snap)
+        self._json({'ok': True, **payload})
 
     def api_score(self, body):
         """手动触发评分/分类。tasks 控制执行内容（可独立开关）：
@@ -3805,6 +3893,7 @@ class Handler(BaseHTTPRequestHandler):
                 if renamed is None:
                     return self._json({'ok': False, 'error': '文件夹重命名失败（_archive 目标已存在）'})
                 rp = renamed
+                _migrate_album_paths(Path(old_key), rp)   # 迁移 state/faces/dates/缓存路径
                 states.pop(old_key, None)
                 states.pop(str(removed), None)
                 states[str(rp)] = 'archived'
@@ -3822,6 +3911,7 @@ class Handler(BaseHTTPRequestHandler):
                 if renamed is None:
                     return self._json({'ok': False, 'error': '文件夹重命名失败（_tidied 目标已存在）'})
                 rp = renamed
+                _migrate_album_paths(Path(old_key), rp)   # 迁移 state/faces/dates/缓存路径
                 states.pop(old_key, None)
                 states[str(rp)] = 'tidied'
             else:
@@ -3830,6 +3920,7 @@ class Handler(BaseHTTPRequestHandler):
                 if removed is None:
                     return self._json({'ok': False, 'error': '文件夹重命名失败（目标已存在或不可写）'})
                 rp = removed
+                _migrate_album_paths(Path(old_key), rp)   # 迁移 state/faces/dates/缓存路径
                 states.pop(old_key, None)
                 states.pop(str(rp), None)
         except Exception as e:
@@ -4006,15 +4097,7 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .card{position:relative;border:2px solid #444;border-radius:5px;overflow:hidden;cursor:pointer;transition:.12s;background:#222;flex-shrink:0}
 .card:hover{border-color:#777}
 .card.sel{border-color:#27ae60;background:#142814}
-.card.lsel{border-color:#2980b9;box-shadow:0 0 6px rgba(41,128,185,.5)}
-#labelPanel{position:fixed;top:70px;left:0;bottom:0;width:200px;background:#1f1f1f;border-right:1px solid #333;z-index:90;display:none;flex-direction:column;overflow-y:auto;padding:8px}
-#labelPanel.on{display:flex}
-#labelPanel h3{font-size:12px;color:#888;margin:8px 0 4px;border-bottom:1px solid #333;padding-bottom:4px}
-#labelPanel .lp-item{display:flex;align-items:center;gap:6px;padding:4px 6px;cursor:pointer;border-radius:4px;font-size:12px;color:#ccc}
-#labelPanel .lp-item:hover{background:#2a2a2a}
-#labelPanel .lp-dot{width:12px;height:12px;border-radius:3px;flex-shrink:0}
-#labelPanel .lp-count{color:#666;font-size:10px;margin-left:auto}
-#labelPanel .lp-new{color:#2980b9;cursor:pointer;font-size:12px;padding:6px}
+.card.asel{border-color:#2980b9;box-shadow:0 0 6px rgba(41,128,185,.5)}
 .card .thumb{display:block;max-height:150px;pointer-events:none}
 .card .star{position:absolute;top:4px;right:4px;font-size:14px;color:#f1c40f;text-shadow:0 0 3px rgba(0,0,0,.8);z-index:5;pointer-events:none;display:none}
 .card .star.on{display:block}
@@ -4100,7 +4183,6 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
       <span class="mi-title" onclick="toggleMenu(this)">视图</span>
       <div class="menu-drop">
         <button class="mi" id="filterBtn" onclick="toggleFilterPanel()"><span class="chk"></span>筛选…</button>
-        <button class="mi" id="labelBtn" onclick="toggleLabel()"><span class="chk" id="labelChk"></span>标注模式</button>
         <div class="mi-sep"></div>
         <button class="mi" id="pregenBtn" onclick="cyclePregen()" title="缩略图预加载：自动=无标记相册加载、已整理/已归档不加载；开/关=强制全局">缩略图:自动</button>
         <div class="mi-sep"></div>
@@ -4149,7 +4231,6 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 </div>
 <div id="mergeBar" style="display:none;background:#1a1a2e;border-bottom:1px solid #333;padding:4px 16px;gap:6px;flex-wrap:wrap;align-items:center"></div>
 <div class="layout">
-  <div id="labelPanel"><h3>人物 (coser)</h3><div id="lpPersons"></div><div class="lp-new" onclick="createPerson()">➕ 新建人物</div><h3>角色</h3><div id="lpRoles"></div><div class="lp-new" onclick="createRole()">➕ 新建角色</div><div class="lp-new" onclick="clearLabelSelection()">✕ 清除选中</div></div>
   <div class="main" id="mainArea">
     <div id="grp"></div>
     <div class="note" id="noteBar">左键切换保留 · 右键预览大图</div>
@@ -4246,7 +4327,7 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 let DATA=[], GROUPS=[], TP=0, TK=0, CACHE_BUST=0, FILTER_PID=null, FILTER_GROUP=null;
 let VIEW='photos'; // 'albums' | 'photos' | 'persons' | 'person_photos'
 let ALBUM_ROOT=''; // 相册根目录（打开相册时记住，返回时用）
-let LABEL_MODE=false, LABEL_SEL=new Set();
+let ASSIGN_MODE=false, ASSIGN_SEL=new Set();  // 批量指定人物/角色模式（统一入口在分类栏）
 let NAV_GEN=0; // 导航代次：每次切换视图/目录 +1，过期请求返回时不覆盖当前界面
 
 const PV={el:null,wrap:null,img:null,scale:1,tx:0,ty:0,drag:false,dsx:0,dsy:0,dtx:0,dty:0};
@@ -4292,19 +4373,22 @@ function _rcol(rid){return _pcol(rid+100)}
 function renderPhotos(){
   GROUPS=DATA.groups||[];TP=0;GROUPS.forEach(g=>TP+=g.length);
   document.getElementById('dirInput').value=DATA.dir||'';
-  // 人物筛选条（双击改名）
+  // 人物分类栏：筛选 / 改名 / 合并 / 批量指定 / 新建（统一入口）
   let ph='';
-  if(DATA.persons&&DATA.persons.length){
-    ph+='<div class="pbar"><span class="plabel">👤</span>';
-    ph+=`<span class="pchip ${FILTER_PID===null&&FILTER_GROUP===null?'on':''}" onclick="setFilter(null)" style="border-color:#666">全部</span>`;
-    DATA.persons.forEach(ps=>{
-      const on=FILTER_PID===ps.id;
-      const label=ps.name||('人物'+ps.id);
-      const unconf=!ps.name&&!ps.confirmed?'style="border-style:dashed"':'';
-      ph+=`<span class="pchip ${on?'on':''}" draggable="true" onclick="setFilter(${ps.id})" ondblclick="renamePerson(${ps.id})" oncontextmenu="event.preventDefault();mergeTo(${ps.id})" ondragstart="DRAG_PID=${ps.id}" ondragover="event.preventDefault()" ondrop="mergeDrop(${ps.id})" style="border-color:${ps.color};${on?'background:'+ps.color:''};${unconf?'border-style:dashed':''}" title="双击改名 · 右键合并 · 拖拽合并">${label} ${!ps.name?'🔶':''}<b>${ps.count}</b></span>`;
-    });
-    ph+='</div>';
-  }
+  const asg=ASSIGN_MODE;
+  ph+='<div class="pbar"><span class="plabel">👤</span>';
+  ph+=`<span class="pchip ${FILTER_PID===null&&FILTER_GROUP===null&&!asg?'on':''}" onclick="setFilter(null)" style="border-color:#666">全部</span>`;
+  (DATA.persons||[]).forEach(ps=>{
+    const on=FILTER_PID===ps.id;
+    const label=ps.name||('人物'+ps.id);
+    const unconf=!ps.name&&!ps.confirmed?'border-style:dashed;':'';
+    const act=asg?`assignToPerson(${ps.id})`:`setFilter(${ps.id})`;
+    const title=asg?'点此把已选照片指定给该人物':'单击筛选 · 双击改名 · 右键合并 · 拖拽合并';
+    ph+=`<span class="pchip ${on&&!asg?'on':''}" draggable="${!asg}" onclick="${act}" ondblclick="${asg?'':`renamePerson(${ps.id})`}" oncontextmenu="event.preventDefault();${asg?'':`mergeTo(${ps.id})`}" ondragstart="DRAG_PID=${ps.id}" ondragover="event.preventDefault()" ondrop="mergeDrop(${ps.id})" style="border-color:${ps.color};${on&&!asg?'background:'+ps.color+';':''}${unconf}" title="${title}">${label} ${!ps.name?'🔶':''}<b>${ps.count}</b></span>`;
+  });
+  ph+=`<span class="pchip ${asg?'on':''}" onclick="toggleAssignMode()" style="border-color:#2980b9;${asg?'background:#2980b9;':''}" title="批量指定：开启后点选照片，再点人物完成分配">✎ 指定${asg&&ASSIGN_SEL.size?'('+ASSIGN_SEL.size+')':''}</span>`;
+  ph+=`<span class="pchip" onclick="createPerson()" style="border-color:#27ae60" title="新建人物">＋人物</span>`;
+  ph+='</div>';
   // 合照类别筛选条（"含xxx的合照"）
   if(DATA.group_photos&&DATA.group_photos.length){
     ph+='<div class="pbar"><span class="plabel">👥</span>';
@@ -4314,17 +4398,15 @@ function renderPhotos(){
     });
     ph+='</div>';
   }
-  // 角色筛选条
-  if(DATA.roles&&DATA.roles.length){
-    ph+='<div class="pbar"><span class="plabel">🎭</span>';
-    DATA.roles.forEach(rl=>{
-      const label=rl.name||('角色'+rl.id);
-      ph+=`<span class="pchip" ondblclick="renameRole(${rl.id})" style="border-color:${rl.color}" title="双击改名">${label} <b>${rl.count}</b></span>`;
-    });
-    ph+='</div>';
-  }
-  // 标注模式左侧面板
-  if(LABEL_MODE) renderLabelPanel();
+  // 角色栏：批量指定时点角色分配；否则仅双击改名
+  ph+='<div class="pbar"><span class="plabel">🎭</span>';
+  (DATA.roles||[]).forEach(rl=>{
+    const label=rl.name||('角色'+rl.id);
+    const act=asg?`assignToRole(${rl.id})`:'void 0';
+    ph+=`<span class="pchip" onclick="${act}" ondblclick="renameRole(${rl.id})" style="border-color:${rl.color}" title="${asg?'点此把已选照片指定给该角色':'双击改名'}">${label} <b>${rl.count}</b></span>`;
+  });
+  ph+=`<span class="pchip" onclick="createRole()" style="border-color:#27ae60" title="新建角色">＋角色</span>`;
+  ph+='</div>';
   let h=ph;GROUPS.forEach((g,gi)=>{
     let vis=g.filter(p=>(FILTER_PID===null||p.person_id===FILTER_PID)&&(FILTER_GROUP===null||(p.is_group&&p.group_pids&&p.group_pids.includes(FILTER_GROUP))||(!p.is_group&&p.person_id===FILTER_GROUP))&&_passScoreFilter(p)&&_passTagFilter(p));
     if(vis.length===0) return;
@@ -4344,11 +4426,11 @@ function renderPhotos(){
       const pColor=p.person_id!==null?_pcol(p.person_id):'transparent';
       const rColor=p.role_id!==null?_rcol(p.role_id):'transparent';
       const selCls=p.keep?'sel':'';
-      const lsel=LABEL_SEL.has(p.id)?'lsel':'';
-      const clickFn=LABEL_MODE?`toggleLabelSel(${p.id})`:`toggleKeep(${p.id})`;
-      const ctxMenu=LABEL_MODE?'event.preventDefault()':`event.preventDefault();openPreviewById(${p.id})`;
+      const asel=ASSIGN_SEL.has(p.id)?'asel':'';
+      const clickFn=ASSIGN_MODE?`toggleAssignSel(${p.id})`:`toggleKeep(${p.id})`;
+      const ctxMenu=ASSIGN_MODE?'event.preventDefault()':`event.preventDefault();openPreviewById(${p.id})`;
       const scoreTitle=`组内排名(百分位) · 对焦:${p.s_sharp??0} 曝光:${p.s_exp??0} 对比度:${p.s_contrast??0} 表情:${p.s_face??0}`;
-      h+=`<div class="card ${selCls} ${lsel}" onclick="${clickFn}" oncontextmenu="${ctxMenu}" data-id="${p.id}" title="${p.merge_pending?'待确认归属':''}">
+      h+=`<div class="card ${selCls} ${asel}" onclick="${clickFn}" oncontextmenu="${ctxMenu}" data-id="${p.id}" title="${p.merge_pending?'待确认归属':''}">
         <div class="star ${p.star?'on':''}">★</div>
         <div class="pmark" style="position:absolute;top:0;left:0;width:4px;height:100%;background:${pColor};z-index:6;${p.merge_pending?'opacity:.7':''}"></div>
         <div class="pmark" style="position:absolute;top:0;left:4px;width:3px;height:100%;background:${rColor};z-index:6"></div>
@@ -4612,57 +4694,42 @@ async function loadMergeSuggestions(){
   bar.innerHTML=h;
 }
 
-// ── 标注模式 ──────────────────────────────────
-function toggleLabel(){
-  LABEL_MODE=!LABEL_MODE;
-  const chk=document.getElementById('labelChk');
-  if(chk)chk.textContent=LABEL_MODE?'✓':'';
-  document.getElementById('labelPanel').classList.toggle('on',LABEL_MODE);
-  if(!LABEL_MODE) LABEL_SEL.clear();
+// ── 人物/角色分类：统一在分类栏操作（筛选 / 改名 / 合并 / 批量指定）──
+// 「✎ 指定」开启批量指定模式：点选照片（可多选），再点人物/角色 chip 完成分配。
+function toggleAssignMode(){
+  ASSIGN_MODE=!ASSIGN_MODE;
+  if(!ASSIGN_MODE) ASSIGN_SEL.clear();
   render();
+  if(ASSIGN_MODE) document.getElementById('st').textContent='指定模式：点选照片，再点人物/角色完成分配';
 }
-function renderLabelPanel(){
-  let h='';
-  (DATA.persons||[]).forEach(ps=>{
-    const label=ps.name||('人物'+ps.id);
-    h+=`<div class="lp-item" onclick="assignToPerson(${ps.id})"><span class="lp-dot" style="background:${ps.color}"></span>${label}<span class="lp-count">${ps.count}</span></div>`;
-  });
-  document.getElementById('lpPersons').innerHTML=h;
-  let rh='';
-  (DATA.roles||[]).forEach(rl=>{
-    const label=rl.name||('角色'+rl.id);
-    rh+=`<div class="lp-item" onclick="assignToRole(${rl.id})"><span class="lp-dot" style="background:${rl.color}"></span>${label}<span class="lp-count">${rl.count}</span></div>`;
-  });
-  document.getElementById('lpRoles').innerHTML=rh;
-}
-function toggleLabelSel(id){
-  if(LABEL_SEL.has(id)) LABEL_SEL.delete(id); else LABEL_SEL.add(id);
+function toggleAssignSel(id){
+  if(ASSIGN_SEL.has(id)) ASSIGN_SEL.delete(id); else ASSIGN_SEL.add(id);
   const card=document.querySelector('.card[data-id="'+id+'"]');
-  if(card) card.classList.toggle('lsel');
-  document.getElementById('st').textContent=`标注模式 · 已选 ${LABEL_SEL.size} 张`;
+  if(card) card.classList.toggle('asel');
+  document.getElementById('st').textContent=`指定模式 · 已选 ${ASSIGN_SEL.size} 张（点人物/角色完成分配）`;
 }
 async function assignToPerson(pid){
-  if(LABEL_SEL.size===0){alert('请先点选照片');return}
-  const ids=[...LABEL_SEL];
+  if(ASSIGN_SEL.size===0){alert('请先在「✎ 指定」模式下点选照片');return}
+  const ids=[...ASSIGN_SEL];
   await fetch('/api/reassign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:ids,person_id:pid})});
-  LABEL_SEL.clear();await reloadData();
+  ASSIGN_SEL.clear();await reloadData();
+  document.getElementById('st').textContent=`已指定 ${ids.length} 张到该人物`;
 }
 async function assignToRole(rid){
-  if(LABEL_SEL.size===0){alert('请先点选照片');return}
-  const ids=[...LABEL_SEL];
+  if(ASSIGN_SEL.size===0){alert('请先在「✎ 指定」模式下点选照片');return}
+  const ids=[...ASSIGN_SEL];
   await fetch('/api/assign_role',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:ids,role_id:rid})});
-  LABEL_SEL.clear();await reloadData();
+  ASSIGN_SEL.clear();await reloadData();
+  document.getElementById('st').textContent=`已指定 ${ids.length} 张到该角色`;
 }
 async function createPerson(){
   const name=prompt('新建人物名称（留空则自动编号）');
   if(name===null) return;
-  // 创建新人物：注册一个空 embedding 人物（用 reassign 的人当前 person_id 设到一个新 id）
-  // 简化：直接给选中照片分配到"新建"——后端没有直接新建空人物的 API，用 roles 的 create 模式类似
-  // 这里用 reassign 到一个不存在的 id 触发后端注册（但 _merge_persons 不支持）
-  // 实际：新建人物需后端支持，这里用 /api/reassign action=create
+  // 后端 /api/reassign 支持 action=create_person（注册空 embedding 人物）
   const r=await fetch('/api/reassign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'create_person',name:name||''})});
   const d=await r.json();
   if(d.ok){await reloadData()}
+  else alert('新建失败: '+(d.error||'未知错误'))
 }
 async function createRole(){
   const name=prompt('新建角色名称（如：绝区零-妮可）');
@@ -4670,8 +4737,8 @@ async function createRole(){
   const r=await fetch('/api/assign_role',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'create',name:name})});
   const d=await r.json();
   if(d.ok){await reloadData()}
+  else alert('新建失败: '+(d.error||'未知错误'))
 }
-function clearLabelSelection(){LABEL_SEL.clear();render()}
 async function renamePerson(pid,currentName){
   const name=prompt('修改人物名称',currentName||('人物'+pid));
   if(name===null) return;
