@@ -4104,6 +4104,9 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .card .clabel{padding:2px 5px;font-size:9px;color:#666;text-align:center;white-space:nowrap}
 .card .tag{color:#fff;font-size:8px;padding:1px 3px;border-radius:2px;text-shadow:0 0 2px rgba(0,0,0,.8);line-height:1.2}
 .pbar{display:flex;flex-wrap:wrap;gap:6px;padding:6px 16px;background:#1f1f1f;border-bottom:1px solid #333;align-items:center}
+/* 分类栏（人物/合照/角色）吸顶，滚动照片时固定不动 */
+.pbar-wrap{position:sticky;top:0;z-index:60;background:#1f1f1f;box-shadow:0 3px 10px rgba(0,0,0,.5)}
+.pbar-wrap .pbar:last-child{border-bottom:1px solid #333}
 .albums{display:flex;flex-wrap:wrap;gap:12px;padding:16px}
 .abanner{width:100%;display:flex;align-items:center;gap:12px;padding:8px 0;margin-bottom:8px}
 .abanner h2{font-size:16px;color:#fff;flex:1}
@@ -4438,7 +4441,9 @@ function renderPhotos(){
   });
   ph+=`<span class="pchip" onclick="createRole()" style="border-color:#27ae60" title="新建角色">＋角色</span>`;
   ph+='</div>';
-  let h=ph;GROUPS.forEach((g,gi)=>{
+  // 分类栏整体包裹进吸顶容器：滚动照片时固定顶部
+  let h=ph?`<div class="pbar-wrap">${ph}</div>`:'';
+  GROUPS.forEach((g,gi)=>{
     let vis=g.filter(p=>(FILTER_PID===null||p.person_id===FILTER_PID)&&(FILTER_GROUP===null||(p.is_group&&p.group_pids&&p.group_pids.includes(FILTER_GROUP))||(!p.is_group&&p.person_id===FILTER_GROUP))&&_passScoreFilter(p)&&_passTagFilter(p));
     if(vis.length===0) return;
     h+=`<div class="grp"><div class="ghdr">组${gi+1} — ${g.length}张${(FILTER_PID!==null||FILTER_GROUP!==null)?' (筛选'+vis.length+')':''}</div><div class="photos">`;
