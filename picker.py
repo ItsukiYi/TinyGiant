@@ -773,8 +773,10 @@ def compute_roles(root, groups) -> None:
     if not role_sigs:
         return
     assigned = 0
+    _task_phase('角色归类', sum(len(g) for g in groups), 0)
     for g in groups:
         for p in g:
+            _task_tick()
             if p.role_id is not None:
                 continue  # 已有角色，跳过
             sig = _frame_sig(root, p)
@@ -801,9 +803,11 @@ def score_groups(root, groups, dims=None) -> None:
     import time as _t
     t0 = _t.time()
     total_star = 0
-    for g in groups:
+    _task_phase('质量评分', sum(len(g) for g in groups), 0)
+    for _gi, g in enumerate(groups):
         raws = []
-        for p in g:
+        for _pi, p in enumerate(g):
+            _task_tick()
             try:
                 raws.append(_score_photo(root, p))
             except Exception:
@@ -862,6 +866,8 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     # 打断机制：记录本次扫描代次，各耗时循环检查 _scan_gen_stale(gen)。
     # 主页/新相册请求递增代次后，本扫描尽快提前退出（保留已扫缓存，不发布半成品）。
     gen = _scan_gen_take()
+    _task_begin('扫描相册', f'扫描 {root.name}')
+    _task_phase('收集文件', 0, 0)
 
     # 收集文件：os.walk 替代 rglob("*")——边遍历边可打断，同时剪枝缓存/回收站目录
     files = []
@@ -874,12 +880,14 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
                     cancelled = True
                     break
                 files.append(Path(dirpath) / fn)
+            _task_tick(len(files))
             if cancelled:
                 break
     except OSError:
         cancelled = True
     if cancelled:
         print("  > 扫描已打断（用户切换主页/相册），保留已收集的部分缓存")
+        _task_end('扫描已取消')
     previews = [f for f in files if f.suffix in PREVIEW_EXTS
                 and f.parent.name not in SKIP_DIRS and is_real_photo(f)]
     if not previews:
@@ -899,14 +907,17 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     previews = list(by_stem.values())
 
     photos = []
+    _task_phase('构造照片', len(previews), 0)
     for i, f in enumerate(previews):
         if i % 100 == 0 and i > 0 and _scan_gen_stale(gen):
             print(f"  > 扫描已打断（构造照片阶段，已处理 {i} 张）")
             break
         p = Photo(f); p.find_raw(); photos.append(p)
+        _task_tick(i + 1)
 
     photos.sort(key=lambda p: p.num)
     if not photos:
+        _task_end('扫描完成：无照片')
         return []
 
     # 还原持久化状态（keep/star/score）
@@ -920,10 +931,12 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
     # 二次打开同一相册时基本免解析，速度接近瞬时。
     dates = _load_dates(root)
     dates_dirty = False
+    _task_phase('解析拍摄时间', len(photos), 0)
     for i, p in enumerate(photos):
         if i % 50 == 0 and i > 0 and _scan_gen_stale(gen):
             print(f"  > 扫描已打断（拍摄时间解析阶段，已处理 {i}/{len(photos)} 张）")
             break
+        _task_tick(i)
         sig = _photo_sig(p.preview)
         rec = dates.get(str(p.preview)) if sig else None
         if rec and rec.get('sig') == sig and rec.get('dt'):
@@ -939,11 +952,14 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
         _save_dates(root, dates)
 
     # 分组（EXIF 时间权威：编号跳跃或间隔 >30s 拆组）
+    _task_phase('连拍分组', len(photos), 0)
     groups = [[photos[0]]]
     for i in range(1, len(photos)):
         if i % 200 == 0 and _scan_gen_stale(gen):
             print(f"  > 扫描已打断（分组阶段），返回已扫部分数据")
             break
+        if i % 50 == 0:
+            _task_tick(i)
         prev, cur = photos[i-1], photos[i]
         gap = cur.num - prev.num
         td = 999
@@ -956,10 +972,12 @@ def scan(root: str, max_gap: int = 0, time_gap: int = 0, start_workers: bool = F
         # 被打断：保留已扫磁盘缓存；不启动后台评分，返回已扫部分（api_scan 不会发布）
         if newly_marked:
             save_state(str(root), groups)
+        _task_end('扫描已取消')
         return groups
 
     total_raw = sum(1 for p in photos if p.raw)
     print(f"> {len(photos)} 张, {total_raw} 张 ARW, {len(groups)} 个连拍组")
+    _task_end(f'扫描完成：{len(photos)} 张 / {len(groups)} 组')
 
     # 后台评分（不阻塞 HTTP 响应）：缓存生成 → 清晰度/曝光评分 → 人脸评分
     if start_workers:
@@ -1269,6 +1287,8 @@ def pregenerate_cache(root: str, photos: list, gen: int | None = None):
     cache = _cache_dir(root_p)
     cache.mkdir(exist_ok=True)
     t0 = _t.time()
+    own = _task_ensure('生成缩略图', f'生成缩略图：{root_p.name}（{len(photos)} 张）')
+    _task_phase('生成缩略图', len(photos), 0)
 
     def gen_one(p) -> int:
         if gen is not None and _scan_gen_stale(gen):
@@ -1286,6 +1306,7 @@ def pregenerate_cache(root: str, photos: list, gen: int | None = None):
     try:
         for i, n in enumerate(ex.map(gen_one, photos)):
             count += n
+            _task_tick(i + 1)
             if (i + 1) % 100 == 0:
                 print(f"  cache {i+1}/{len(photos)} ({count} 个)...", end='', flush=True)
             if gen is not None and i % 20 == 0 and i > 0 and _scan_gen_stale(gen):
@@ -1297,6 +1318,8 @@ def pregenerate_cache(root: str, photos: list, gen: int | None = None):
     el = _t.time() - t0
     if count: print(f"  生成 {count} 个缓存 ({el:.0f}s)")
     else: print(f"  缓存已就绪 ({el:.0f}s)")
+    if own:
+        _task_end(f'缩略图完成：新增 {count} 个（{el:.0f}s）')
 
 
 
@@ -1466,7 +1489,9 @@ def execute_delete(root, del_list) -> tuple[int, int, Path, set]:
     trash.mkdir(parents=True, exist_ok=True)
     ok, err = 0, 0
     touched = set()
-    for f in del_list:
+    _task_phase('移入回收站', len(del_list), 0)
+    for _di, f in enumerate(del_list):
+        _task_tick(_di)
         try:
             if not f.exists():
                 continue
@@ -1657,6 +1682,82 @@ def _scan_gen_stale(gen: int) -> bool:
     """该代次的扫描是否已被更新请求（主页/新相册）取消。"""
     with _scan_lock:
         return gen != _scan_gen
+
+# ── 统一任务进度（进度条 / 任务说明 / trace 首行）────────────
+# 所有耗时操作（扫描、缩略图、评分、人物识别、导出、删除）都登记在此，
+# 前端轮询 /api/task 显示：任务名 → 当前阶段（任务说明）、进度条、trace 首行。
+_TASK = {'id': 0, 'name': '', 'phase': '', 'cur': 0, 'total': 0,
+         'msg': '', 'trace': [''], 't0': 0.0, 'done': True, 'err': ''}
+_TASK_LOCK = threading.RLock()
+
+def _task_ensure(name: str, msg: str = '') -> bool:
+    """若当前无活跃任务则开一个（返回 True=本次拥有，负责 end）；
+    已有任务（嵌套调用）则只返回 False，由上层统一 end，避免任务名被覆盖。"""
+    with _TASK_LOCK:
+        if _TASK['done']:
+            _task_begin(name, msg)
+            return True
+        return False
+
+def _task_begin(name: str, msg: str = '') -> int:
+    """开始一个新任务（同时只有一个前台任务在展示）。"""
+    import time as _t
+    with _TASK_LOCK:
+        _TASK.update(id=_TASK['id'] + 1, name=name, phase='', cur=0, total=0,
+                     msg=msg, trace=[(msg or name)], t0=_t.time(), done=False, err='')
+        return _TASK['id']
+
+def _task_phase(phase: str, total: int = 0, cur: int = 0) -> None:
+    """切换阶段（即"任务说明"），并重置/设定该阶段总量。"""
+    with _TASK_LOCK:
+        if _TASK['done']:
+            return
+        _TASK['phase'] = phase
+        _TASK['total'] = total
+        _TASK['cur'] = cur
+
+def _task_tick(cur: int | None = None, total: int | None = None) -> None:
+    """推进进度（每处理一项调用；调用频率低，开销可忽略）。"""
+    with _TASK_LOCK:
+        if _TASK['done']:
+            return
+        if total is not None:
+            _TASK['total'] = total
+        if cur is not None:
+            _TASK['cur'] = cur
+        else:
+            _TASK['cur'] += 1
+
+def _task_note(msg: str) -> None:
+    """追加一条 trace（首行在开始时就已固定，这里记录过程/异常）。"""
+    with _TASK_LOCK:
+        tr = _TASK['trace']
+        tr.append(msg)
+        if len(tr) > 20:
+            del tr[1:len(tr) - 19]   # 保留首行 + 最近 19 条
+
+def _task_end(msg: str = '', err: str = '') -> None:
+    with _TASK_LOCK:
+        _TASK['done'] = True
+        if msg:
+            _TASK['msg'] = msg
+            _TASK['trace'].append(msg)
+        if err:
+            _TASK['err'] = err
+            _TASK['trace'].append('错误: ' + err)
+
+def _task_snap() -> dict:
+    """前端轮询用的快照（含耗时、百分比、trace 首行）。"""
+    import time as _t
+    with _TASK_LOCK:
+        d = dict(_TASK)
+        d['trace'] = list(_TASK['trace'])
+    d['elapsed'] = round(_t.time() - d['t0'], 1) if d['t0'] else 0
+    t = d['total']
+    d['pct'] = (round(100 * d['cur'] / t) if t else 0)
+    d['head'] = d['trace'][0] if d['trace'] else ''
+    return d
+
 
 # 缓存的 MediaPipe 模型
 _face_landmarker = None
@@ -2888,7 +2989,9 @@ def _extract_all_faces(root, photos) -> list:
     faces_dirty = False
     current_paths = set()
     rows = []
-    for p in photos:
+    _task_phase('人脸检测/特征提取', len(photos), 0)
+    for _idx, p in enumerate(photos):
+        _task_tick(_idx)
         current_paths.add(str(p.preview))
         faces = getattr(p, '_face_data', None) or []
         if not faces:
@@ -3134,6 +3237,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path == '/':           return self.html_index()
             if p.path == '/api/data':   return self.api_data()
             if p.path == '/api/status': return self.api_status()
+            if p.path == '/api/task':   return self._json(_task_snap())
             if p.path == '/api/log':   return self.api_log(q)
             if p.path == '/api/reload': return self.api_reload()
             if p.path == '/api/persons': return self.api_persons(q)
@@ -3709,23 +3813,28 @@ class Handler(BaseHTTPRequestHandler):
         def _bg_score():
             global scoring_busy
             my_gen = score_gen
+            task_name = ('人物识别' if tasks & {'persons', 'roles'} and not run_score and not run_cache
+                         else ('生成缩略图' if tasks == {'cache'} else '评分任务'))
+            _task_begin(task_name, f'{task_name}：{len(photos_flat)} 张照片')
             try:
                 if run_cache:
                     pregenerate_cache(root_s, photos_flat, gen=my_gen)
                 if run_score:
-                    if _scan_gen_stale(my_gen): return
+                    if _scan_gen_stale(my_gen): _task_end('已取消'); return
                     compute_subbursts(root_s, groups)
                 if run_persons:
-                    if _scan_gen_stale(my_gen): return
+                    if _scan_gen_stale(my_gen): _task_end('已取消'); return
                     compute_persons(root_s, groups)          # 批量聚类人物 + 全局质心匹配
                 if run_score:
-                    if _scan_gen_stale(my_gen): return
+                    if _scan_gen_stale(my_gen): _task_end('已取消'); return
                     score_groups(root_s, groups, dims=dims)  # 质量评分（闭眼基线用 person_id）
                 if run_roles:
-                    if _scan_gen_stale(my_gen): return
+                    if _scan_gen_stale(my_gen): _task_end('已取消'); return
                     compute_roles(root_s, groups)
+                _task_end(f'{task_name}完成')
             except Exception as e:
                 print(f"  >> 后台任务异常: {e}")
+                _task_end('任务失败', err=str(e))
             finally:
                 scoring_busy = False
         threading.Thread(target=_bg_score, daemon=True).start()
@@ -3974,13 +4083,18 @@ class Handler(BaseHTTPRequestHandler):
         # 执行复制：只复制新增的 ARW（跳过已在历史导出目录中的）
         export_dir.mkdir(parents=True, exist_ok=True)
         copied, skipped = [], []
-        for p in new_photos:
+        own = _task_ensure('导出 ARW', f'导出 ARW：{len(new_photos)} 个')
+        _task_phase('复制 ARW 文件', len(new_photos), 0)
+        for _ei, p in enumerate(new_photos):
+            _task_tick(_ei)
             dst = export_dir / p.raw.name
             if dst.exists():
                 skipped.append(p.raw.name)
                 continue
             shutil.copy2(p.raw, dst)
             copied.append(p.raw.name)
+        if own:
+            _task_end(f'导出完成：{len(copied)} 个')
         save_state(scan_root, groups)
         prev_count = len(kept) - len(new_photos)
         if prev_count:
@@ -4003,7 +4117,11 @@ class Handler(BaseHTTPRequestHandler):
                 'to_delete_count': len(del_list),
                 'kept': keep_names, 'kept_count': len(keep_names),
             })
+        own = _task_ensure('删除文件', f'删除文件：{len(del_list)} 个')
+        _task_phase('移入回收站', len(del_list), 0)
         ok, err, _trash, touched = execute_delete(scan_root, del_list)
+        if own:
+            _task_end(f'删除完成：{ok} 个')
         if ok > 0:
             with _state_lock:
                 for g in groups[:]:
@@ -4039,8 +4157,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>连拍挑选</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e0e0e0;overflow:hidden;height:100vh}
-.hdr{position:sticky;top:0;z-index:99;background:#252525;border-bottom:1px solid #333}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+.hdr{position:relative;z-index:99;background:#252525;border-bottom:1px solid #333;flex:0 0 auto}
 .menubar{display:flex;align-items:center;gap:2px;height:32px;padding:0 8px;background:#2b2b2b;border-bottom:1px solid #222}
 .app-title{font-size:13px;font-weight:600;color:#fff;padding:0 10px;white-space:nowrap;user-select:none}
 .menu{position:relative}
@@ -4077,7 +4195,7 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .del-row select{background:#333;border:1px solid #555;border-radius:3px;color:#ddd;padding:2px 6px;font-size:12px;cursor:pointer;outline:none}
 .del-row select:hover{border-color:#777}
 .del-row input[type=checkbox]{accent-color:#2980b9;margin:0}
-.layout{display:flex;height:calc(100vh - 70px)}
+.layout{display:flex;flex:1 1 auto;min-height:0}
 .main{flex:1;overflow-y:auto;min-width:0}
 .main.side-open{flex:0 0 calc(100% - 480px)}
 .side{width:480px;border-left:1px solid #333;display:flex;flex-direction:column;background:#222;position:relative}
@@ -4146,6 +4264,18 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 .pbar .pchip{font-size:11px;padding:3px 10px;border:1px solid;border-radius:14px;cursor:pointer;color:#ddd;background:#2a2a2a;transition:.12s}
 .pbar .pchip:hover{filter:brightness(1.2)}
 .pbar .pchip.on{color:#fff;font-weight:bold}
+/* 任务进度条：任务名 · 阶段说明 · 计数/耗时 · 进度 · trace 首行 */
+#taskBar{flex:0 0 auto;background:#1c1c1c;border-bottom:1px solid #333;padding:4px 16px 5px;display:none}
+#taskBar.on{display:block}
+#taskBar .tb-row{display:flex;align-items:center;gap:10px;font-size:11px;color:#bbb}
+#taskBar .tb-name{color:#e8e8e8;font-weight:600}
+#taskBar .tb-phase{color:#f1c40f}
+#taskBar .tb-count{color:#888;margin-left:auto;white-space:nowrap}
+#taskBar .tb-track{height:3px;background:#333;border-radius:2px;margin-top:4px;overflow:hidden;position:relative}
+#taskBar .tb-fill{height:100%;width:0;background:linear-gradient(90deg,#2980b9,#27ae60);transition:width .25s}
+#taskBar .tb-fill.indet{width:35%;animation:tbSlide 1.1s infinite linear}
+@keyframes tbSlide{0%{margin-left:-35%}100%{margin-left:100%}}
+#taskBar .tb-head{font-size:10px;color:#666;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center}
 .modal.on{display:flex}
 .mc{background:#2a2a2a;border-radius:10px;padding:20px;max-width:580px;width:92%;max-height:85vh;overflow-y:auto}
@@ -4244,6 +4374,15 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
       <button class="btn del" id="delBtn" onclick="execDel()" disabled>删除</button>
     </div>
   </div>
+</div>
+<div id="taskBar">
+  <div class="tb-row">
+    <span class="tb-name" id="tbName">任务</span>
+    <span class="tb-phase" id="tbPhase"></span>
+    <span class="tb-count" id="tbCount"></span>
+  </div>
+  <div class="tb-track"><div class="tb-fill" id="tbFill"></div></div>
+  <div class="tb-head" id="tbHead"></div>
 </div>
 <div id="mergeBar" style="display:none;background:#1a1a2e;border-bottom:1px solid #333;padding:4px 16px;gap:6px;flex-wrap:wrap;align-items:center"></div>
 <div class="layout">
@@ -4392,6 +4531,7 @@ async function runPregenNow(){
     const d=await r.json();
     if(!d.ok){alert('启动失败: '+(d.error||'未知错误'));return}
     document.getElementById('st').textContent=`缩略图生成中… (0/${TP})`;
+    taskPend(`生成缩略图… 0/${TP}`);pollTask();
     pollScores('pregen')
   }catch(e){alert('请求失败: '+e.message)}
 }
@@ -4829,6 +4969,7 @@ async function openDir(){
   const myGen=++NAV_GEN; // 本请求导航代次：期间若用户回主页/开其他相册，结果作废
   btn.disabled=true;btn.textContent='扫描中…';
   document.getElementById('st').textContent='扫描目录中…';
+  taskPend('扫描目录…');pollTask();
   try{
     const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({directory:dir})});
     const d=await r.json();
@@ -4908,6 +5049,7 @@ async function confirmScoring(){
     const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dims:dims,tasks:['cache','score']})});
     const d=await r.json();
     if(!d.ok){alert('评分启动失败: '+d.error);return}
+    taskPend(`质量评分… ${TP} 张`);pollTask();
     pollScores('score')
   }catch(e){alert('评分失败: '+e.message)}
 }
@@ -4927,6 +5069,7 @@ async function confirmClassify(){
     const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasks})});
     const d=await r.json();
     if(!d.ok){alert('识别启动失败: '+d.error);return}
+    taskPend(`人物识别… ${TP} 张`);pollTask();
     pollScores('classify')
   }catch(e){alert('识别失败: '+e.message)}
 }
@@ -4978,6 +5121,59 @@ function _passTagFilter(p){
   return false;
 }
 async function startScoring(){openScorePanel()}
+
+// ── 统一任务进度条（任务名 + 阶段说明 + 进度 + trace 首行）──
+let _taskTimer=null, _taskPending=false, _taskPendTs=0;
+function _tb(id){return document.getElementById(id)}
+function _taskShow(){const b=_tb('taskBar');if(b)b.classList.add('on')}
+function _taskHide(){const b=_tb('taskBar');if(b)b.classList.remove('on')}
+function _taskRender(t){
+  _taskShow();
+  const name=_tb('tbName'), phase=_tb('tbPhase'), cnt=_tb('tbCount'),
+        head=_tb('tbHead'), fill=_tb('tbFill');
+  if(name)name.textContent=t.name||'任务';
+  if(phase)phase.textContent=t.phase?('· '+t.phase):'';
+  let c='';
+  if(t.total>0)c=`${t.cur}/${t.total}  ${t.pct}%`;
+  else if(t.cur>0)c=`${t.cur}`;
+  if(t.elapsed&&t.elapsed>0)c+=`  ${t.elapsed}s`;
+  if(cnt)cnt.textContent=c;
+  if(head)head.textContent=t.head||'';        // trace 首行
+  if(fill){
+    if(t.total>0){fill.classList.remove('indet');fill.style.width=Math.max(2,t.pct)+'%'}
+    else if(!t.done){fill.classList.add('indet');fill.style.width=''}
+    else {fill.classList.remove('indet');fill.style.width='100%'}
+  }
+}
+// 本地"请求已发出、后端任务还没出现"的等待态（如扫描刚点击）
+function taskPend(label){
+  _taskPending=true;_taskPendTs=Date.now();
+  _taskShow();
+  if(_tb('tbName'))_tb('tbName').textContent=label||'加载中…';
+  if(_tb('tbPhase'))_tb('tbPhase').textContent='';
+  if(_tb('tbCount'))_tb('tbCount').textContent='';
+  if(_tb('tbHead'))_tb('tbHead').textContent='';
+  const f=_tb('tbFill');if(f){f.classList.add('indet');f.style.width=''}
+}
+// 轮询后端任务状态；任务结束后 1.2s 自动隐藏
+function pollTask(){
+  if(_taskTimer){clearInterval(_taskTimer);_taskTimer=null}
+  return new Promise(resolve=>{
+    let idle=0;
+    _taskTimer=setInterval(async()=>{
+      let t;try{t=await(await fetch('/api/task')).json()}catch(e){return}
+      if(!t.done){_taskPending=false;idle=0;taskRender(t);return}
+      // 后端任务已结束：若还在本地等待窗口内，保持不确定进度条（等真任务开始）
+      if(_taskPending && Date.now()-_taskPendTs<8000){
+        idle=0;taskPend(_tb('tbName')?_tb('tbName').textContent:'加载中…');return
+      }
+      _taskPending=false;
+      taskRender(t);
+      idle++;
+      if(idle>=3){clearInterval(_taskTimer);_taskTimer=null;_taskHide();resolve(t)}
+    },400);
+  });
+}
 
 // mode: 'score' | 'classify' | 'pregen'（仅影响状态栏文案）
 async function pollScores(mode){
@@ -5038,6 +5234,7 @@ async function exportARW(){
 async function exportARWConfirm(){
   const md=document.getElementById('md'),mb=document.getElementById('mb');
   mb.innerHTML='<div class="spin"></div><p style="text-align:center;color:#999">正在导出 ARW…</p>';
+  taskPend('导出 ARW…');pollTask();
   try{
     const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});
     const d=await r.json();
@@ -5336,6 +5533,7 @@ async function execDel(){
 async function execDelConfirm(){
   const mb=document.getElementById('mb');
   mb.innerHTML='<div class="spin"></div><p style="text-align:center;color:#999">正在删除…</p>';
+  taskPend('删除文件…');pollTask();
   const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,mode:DEL_OPTS.mode,types:DEL_OPTS.types})});
   const d=await r.json();
   mb.innerHTML=`<h2 style="color:#27ae60">完成</h2>
