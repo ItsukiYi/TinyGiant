@@ -4184,7 +4184,10 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
       <div class="menu-drop">
         <button class="mi" id="filterBtn" onclick="toggleFilterPanel()"><span class="chk"></span>筛选…</button>
         <div class="mi-sep"></div>
-        <button class="mi" id="pregenBtn" onclick="cyclePregen()" title="缩略图预加载：自动=无标记相册加载、已整理/已归档不加载；开/关=强制全局">缩略图:自动</button>
+        <button class="mi" data-keep-open onclick="setPregenMode('auto')"><span class="chk" id="pregenAutoChk"></span>缩略图预加载：按相册（自动）</button>
+        <button class="mi" data-keep-open onclick="setPregenMode('on')"><span class="chk" id="pregenOnChk"></span>缩略图预加载：始终开启</button>
+        <button class="mi" data-keep-open onclick="setPregenMode('off')"><span class="chk" id="pregenOffChk"></span>缩略图预加载：关闭</button>
+        <button class="mi" id="pregenRunBtn" onclick="runPregenNow()" title="对当前打开的相册立即生成缩略图（一次性执行，可随时点主页打断）">立即生成缩略图…</button>
         <div class="mi-sep"></div>
         <button class="mi" id="debugBtn" onclick="toggleDebug()"><span class="chk" id="debugChk"></span>调试</button>
         <button class="mi" id="logBtn" onclick="toggleLog()"><span class="chk" id="logChk"></span>日志</button>
@@ -4193,7 +4196,15 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
     <div class="menu" data-menu="score">
       <span class="mi-title" onclick="toggleMenu(this)">评分</span>
       <div class="menu-drop">
-        <button class="mi" id="scoreBtn" onclick="openScorePanel()"><span class="chk"></span>评分配置…</button>
+        <button class="mi" id="scoreBtn" onclick="openScorePanel()"><span class="chk"></span>质量评分…</button>
+      </div>
+    </div>
+    <div class="menu" data-menu="classify">
+      <span class="mi-title" onclick="toggleMenu(this)">分类</span>
+      <div class="menu-drop">
+        <button class="mi" id="classifyBtn" onclick="openClassifyPanel()"><span class="chk"></span>人物识别…</button>
+        <div class="mi-sep"></div>
+        <button class="mi" onclick="cleanupPersons()">清理人物库</button>
       </div>
     </div>
     <div class="menu" data-menu="help">
@@ -4253,22 +4264,34 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 
 <div class="modal" id="md"><div class="mc" id="mb"></div></div>
 
-<!-- 评分配置面板 -->
+<!-- 质量评分面板（独立于人物识别） -->
 <div class="modal" id="scorePanel">
   <div class="mc" style="max-width:400px">
-    <h2>⚙️ 评分与分类</h2>
-    <p style="color:#888;font-size:12px">执行内容（可独立开关）</p>
-    <label><input type="checkbox" id="taskScore" checked onchange="updateScoreTasks()"> 质量评分（连拍分组 + 清晰度/曝光/对比度/人脸）</label><br>
-    <label><input type="checkbox" id="taskPersons" checked onchange="updateScoreTasks()"> 人物分类（聚类识别 + 角色归类）</label>
-    <hr style="border:none;border-top:1px solid #333;margin:10px 0">
-    <p style="color:#888;font-size:12px">评分维度（仅质量评分时生效）</p>
+    <h2>⭐ 质量评分</h2>
+    <p style="color:#888;font-size:12px">连拍分组 + 按维度打分并推荐星标（未勾选维度不计入总分）</p>
     <label><input type="checkbox" id="dimSharp" checked onchange="updateScoreDims()"> 对焦/清晰度</label><br>
     <label><input type="checkbox" id="dimFace" checked onchange="updateScoreDims()"> 表情/人脸</label><br>
     <label><input type="checkbox" id="dimExp" checked onchange="updateScoreDims()"> 曝光</label><br>
     <label><input type="checkbox" id="dimContrast" checked onchange="updateScoreDims()"> 对比度</label>
+    <p style="color:#666;font-size:11px;margin-top:8px">会先补全缩略图缓存（打分需要）</p>
     <div class="ma">
       <button class="btn btn-cancel" onclick="closeScorePanel()">取消</button>
-      <button class="btn" style="background:#e67e22;color:#fff" onclick="confirmScoring()">确认开始</button>
+      <button class="btn" style="background:#e67e22;color:#fff" onclick="confirmScoring()">开始评分</button>
+    </div>
+  </div>
+</div>
+
+<!-- 人物识别面板（独立栏目） -->
+<div class="modal" id="classifyPanel">
+  <div class="mc" style="max-width:420px">
+    <h2>👤 人物识别</h2>
+    <p style="color:#888;font-size:12px">对本相册人脸做聚类，合并/新建全局人物，并归类角色</p>
+    <label><input type="checkbox" id="taskPersons" checked> 人物识别聚类（同一人自动归为一簇）</label><br>
+    <label><input type="checkbox" id="taskRoles" checked> 角色自动归类（按角色库示例匹配）</label>
+    <p style="color:#666;font-size:11px;margin-top:8px">结果为“待确认”时，可在分类栏双击改名、右键合并</p>
+    <div class="ma">
+      <button class="btn btn-cancel" onclick="closeClassifyPanel()">取消</button>
+      <button class="btn" style="background:#8e44ad;color:#fff" onclick="confirmClassify()">开始识别</button>
     </div>
   </div>
 </div>
@@ -4344,19 +4367,27 @@ async function load(v){const u=v==='albums'?'/api/data?view=albums':'/api/data';
   updatePregenBtn();
   render();updateButtons();updRootCnt()}
 function updatePregenBtn(){
-  const b=document.getElementById('pregenBtn');if(!b)return;
   const m=window._pregenMode||'auto';
-  b.textContent=m==='auto'?'缩略图:自动':(m==='on'?'缩略图:开':'缩略图:关');
+  const set=(id,on)=>{const el=document.getElementById(id);if(el)el.textContent=on?'✓':''};
+  set('pregenAutoChk',m==='auto');set('pregenOnChk',m==='on');set('pregenOffChk',m==='off');
 }
-async function cyclePregen(){
-  const modes=['auto','on','off'];
-  const cur=window._pregenMode||'auto';
-  const nx=modes[(modes.indexOf(cur)+1)%3];
+async function setPregenMode(mode){
   try{
-    const r=await fetch('/api/pregen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:nx})});
+    const r=await fetch('/api/pregen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
     const d=await r.json();
     if(d.ok){window._pregenMode=d.mode;updatePregenBtn()}
     else alert('操作失败: '+d.error)
+  }catch(e){alert('请求失败: '+e.message)}
+}
+// 一次性执行：对当前相册立即生成缩略图（不等下次打开）
+async function runPregenNow(){
+  if(!GROUPS||!GROUPS.length){alert('请先打开一个相册');return}
+  try{
+    const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:['cache']})});
+    const d=await r.json();
+    if(!d.ok){alert('启动失败: '+(d.error||'未知错误'));return}
+    document.getElementById('st').textContent=`缩略图生成中… (0/${TP})`;
+    pollScores('pregen')
   }catch(e){alert('请求失败: '+e.message)}
 }
 function updRootCnt(){const rc=document.getElementById('albumRootCnt');if(rc)rc.textContent=(DATA.roots||[]).length?('· '+(DATA.roots||[]).length):''}
@@ -4791,6 +4822,8 @@ async function openDir(){
       // 补充获取 persons/roles（scan 只返回了 albums）
       try{const d2=await(await fetch('/api/data')).json();if(myGen===NAV_GEN)DATA=d2}catch(e){}
     }else{VIEW='photos'}
+    if(d.pregen_mode){window._pregenMode=d.pregen_mode}
+    updatePregenBtn();
     render();
     updateButtons();
   }catch(e){if(myGen===NAV_GEN)alert('请求失败: '+e.message)}
@@ -4820,30 +4853,25 @@ function updateButtons(){
   if(hb)hb.style.display=atHome?'none':'inline-block';
   const b=document.getElementById('backBtn');
   if(b)b.disabled=atHome;
-  ['scoreBtn','filterBtn'].forEach(id=>{
+  ['scoreBtn','classifyBtn','filterBtn','pregenRunBtn'].forEach(id=>{
     const el=document.getElementById(id);
     if(el)el.disabled=!inPhotos;
   });
 }
 
-// ── 评分配置面板 ──────────────────────────
+// ── 质量评分面板 ──────────────────────────
 function openScorePanel(){
-  // 回显上次选择
+  // 回显上次维度选择
   if(window._scoreDims){
     document.getElementById('dimSharp').checked=window._scoreDims.includes('sharp');
     document.getElementById('dimFace').checked=window._scoreDims.includes('face');
     document.getElementById('dimExp').checked=window._scoreDims.includes('exp');
     document.getElementById('dimContrast').checked=window._scoreDims.includes('contrast');
   }
-  if(window._scoreTasks){
-    document.getElementById('taskScore').checked=window._scoreTasks.includes('score');
-    document.getElementById('taskPersons').checked=window._scoreTasks.includes('persons');
-  }
   document.getElementById('scorePanel').classList.add('on');
 }
 function closeScorePanel(){document.getElementById('scorePanel').classList.remove('on')}
 function updateScoreDims(){/* 占位，无需实时动作 */}
-function updateScoreTasks(){/* 占位，无需实时动作 */}
 function getSelectedDims(){
   const d=[];
   if(document.getElementById('dimSharp').checked)d.push('sharp');
@@ -4852,26 +4880,45 @@ function getSelectedDims(){
   if(document.getElementById('dimContrast').checked)d.push('contrast');
   return d;
 }
-function getSelectedTasks(){
-  const t=[];
-  if(document.getElementById('taskScore').checked)t.push('cache','score');
-  if(document.getElementById('taskPersons').checked)t.push('persons','roles');
-  return t;
-}
 async function confirmScoring(){
   const dims=getSelectedDims();
-  const tasks=getSelectedTasks();
   if(!dims.length){alert('请至少选择一个评分维度');return}
-  if(!tasks.length){alert('请至少选择一项执行内容（质量评分 / 人物分类）');return}
   window._scoreDims=dims;
-  window._scoreTasks=tasks;
   closeScorePanel();
   try{
-    const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dims:dims,tasks:tasks})});
+    // 评分需要缩略图缓存（连拍帧签名），一并预热
+    const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dims:dims,tasks:['cache','score']})});
     const d=await r.json();
-    if(!d.ok){alert('任务启动失败: '+d.error);return}
-    pollScores()
+    if(!d.ok){alert('评分启动失败: '+d.error);return}
+    pollScores('score')
   }catch(e){alert('评分失败: '+e.message)}
+}
+
+// ── 人物识别面板（独立栏目）─────────────────
+function openClassifyPanel(){
+  document.getElementById('classifyPanel').classList.add('on');
+}
+function closeClassifyPanel(){document.getElementById('classifyPanel').classList.remove('on')}
+async function confirmClassify(){
+  const tasks=[];
+  if(document.getElementById('taskPersons').checked)tasks.push('persons');
+  if(document.getElementById('taskRoles').checked)tasks.push('roles');
+  if(!tasks.length){alert('请至少选择一项（人物识别聚类 / 角色自动归类）');return}
+  closeClassifyPanel();
+  try{
+    const r=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasks})});
+    const d=await r.json();
+    if(!d.ok){alert('识别启动失败: '+d.error);return}
+    pollScores('classify')
+  }catch(e){alert('识别失败: '+e.message)}
+}
+async function cleanupPersons(){
+  if(!confirm('清理人物库中被污染/空的条目？此操作会重修全局人物库，建议先在人物库确认。'))return;
+  try{
+    const d=await(await fetch('/api/cleanup')).json();
+    alert('清理完成: '+(d.removed!==undefined?('移除 '+d.removed+' 个'):JSON.stringify(d)));
+    await reloadData();
+  }catch(e){alert('清理失败: '+e.message)}
 }
 
 // ── 筛选面板 ──────────────────────────
@@ -4914,14 +4961,20 @@ function _passTagFilter(p){
 }
 async function startScoring(){openScorePanel()}
 
-async function pollScores(){
+// mode: 'score' | 'classify' | 'pregen'（仅影响状态栏文案）
+async function pollScores(mode){
+  const label=mode==='classify'?'人物识别中':(mode==='pregen'?'缩略图生成中':'评分中');
   for(let i=0;i<600;i++){
     let s;try{s=await(await fetch('/api/status')).json()}catch(e){return}
     if(s.scoring_busy){
-      document.getElementById('st').textContent=`${TP}张 · ${GROUPS.length}组 · 评分中…(${i*3}s)`;
+      document.getElementById('st').textContent=`${TP}张 · ${GROUPS.length}组 · ${label}…(${i*3}s)`;
       await new Promise(r=>setTimeout(r,3000))
     }else{
-      try{const d=await(await fetch('/api/data')).json();DATA=d;render();updateButtons()}catch(e){}
+      try{
+        const d=await(await fetch('/api/data')).json();
+        DATA=d;render();updateButtons();
+        document.getElementById('st').textContent=`${TP}张 · ${GROUPS.length}组 · ${label}完成`;
+      }catch(e){}
       return
     }
   }
@@ -5321,7 +5374,8 @@ function closeMenus(){document.querySelectorAll('.menu.open').forEach(m=>m.class
 document.addEventListener('click',function(e){
   const menu=e.target.closest('.menu');
   if(menu && e.target.closest('.mi')){
-    menu.classList.remove('open');   // 点击菜单项后收起
+    // 带 data-keep-open 的菜单项（如缩略图模式切换）点击后保持菜单展开
+    if(!e.target.closest('[data-keep-open]')) menu.classList.remove('open');
   }else if(!menu){
     closeMenus();                    // 点击菜单外收起
   }
