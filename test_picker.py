@@ -1885,7 +1885,7 @@ def test_api_scan_cancelled_does_not_publish(tmp_path, monkeypatch):
 
 
 def test_api_scan_returns_classification_bars(tmp_path, monkeypatch):
-    """重新打开相册（走 /api/scan）也必须返回 persons/roles/group_photos，
+    """重新打开相册（走 /api/scan）也必须返回 persons/roles/group_total，
     否则上方分类栏不显示（回归修复）。"""
     fake = tmp_path / 'g'; fake.mkdir()
     monkeypatch.setattr(P, '_global_root_cache', None)
@@ -1911,13 +1911,14 @@ def test_api_scan_returns_classification_bars(tmp_path, monkeypatch):
     captured = {}
     _fake_handler(captured).api_scan({'directory': str(d)})
     assert captured.get('ok') is True
-    # 分类栏数据齐全
-    assert [x['id'] for x in captured['persons']] == [1]
-    assert captured['persons'][0]['count'] == 2
-    assert captured['persons'][0]['name'] == '花崎'
+    # 分类栏数据齐全；人物计数含合照参与（pid=1 两张、pid=3 一张合照）
+    by_id = {x['id']: x for x in captured['persons']}
+    assert set(by_id) == {1, 3}
+    assert by_id[1]['count'] == 2      # 单人照 + 合照（主脸）
+    assert by_id[3]['count'] == 1      # 仅作为合照参与者出现
+    assert by_id[1]['name'] == '花崎'
     assert [x['id'] for x in captured['roles']] == [2]
-    assert captured['group_photos']  # 合照聚合（含花崎/同伴的合照）
-    assert [g['pid'] for g in captured['group_photos']] == [1, 3]
+    assert captured['group_total'] == 1  # 合照总数
 
 
 def test_photos_view_payload_matches_api_data(tmp_path, monkeypatch):
@@ -1930,9 +1931,25 @@ def test_photos_view_payload_matches_api_data(tmp_path, monkeypatch):
     payload = P._photos_view_payload([[p]])
     assert payload['view'] == 'photos'
     assert payload['dir'] == '/x'
-    assert 'persons' in payload and 'roles' in payload and 'group_photos' in payload
+    assert 'persons' in payload and 'roles' in payload and 'group_total' in payload
     assert payload['persons'][0]['id'] == 5
     assert isinstance(payload['groups'], list)
+
+
+def test_payload_person_count_includes_group_participants(tmp_path, monkeypatch):
+    """人物计数口径：主脸 + 合照参与者都计入（与前端“按人筛选含合照”一致）。"""
+    fake = tmp_path / 'g3'; fake.mkdir()
+    monkeypatch.setattr(P, '_global_root_cache', None)
+    monkeypatch.setattr(P, '_roots_path', lambda: fake / 'roots.json')
+    monkeypatch.setattr(P, 'current_dir', '')
+    solo = P.Photo(tmp_path / 's.jpg'); solo.person_id = 7
+    grp = P.Photo(tmp_path / 'g.jpg'); grp.person_id = 7; grp.is_group = True
+    grp.group_pids = [7, 9]     # 7 是主脸，9 是参与者
+    payload = P._photos_view_payload([[solo, grp]])
+    by_id = {x['id']: x['count'] for x in payload['persons']}
+    assert by_id[7] == 2       # 单人照 + 合照
+    assert by_id[9] == 1       # 只作为参与者出现
+    assert payload['group_total'] == 1
 
 
 def test_scan_os_walk_still_finds_photos(tmp_path):

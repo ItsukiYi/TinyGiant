@@ -3058,14 +3058,25 @@ def compute_persons(root, groups) -> dict:
     return stats
 
 def _photos_view_payload(snap: list, dir_str: str | None = None) -> dict:
-    """照片视图的完整响应载荷：groups + persons/roles/group_photos + pregen_mode。
+    """照片视图的完整响应载荷：groups + persons/roles/group_total + pregen_mode。
     api_data 与 api_scan 共用同一份组装逻辑——此前 api_scan 不返回 persons/roles，
-    导致从相册首页重新打开相册（走 scan）后上方分类栏不显示。"""
+    导致从相册首页重新打开相册（走 scan）后上方分类栏不显示。
+
+    人物计数口径：该人**出现过的所有照片**（主脸是 TA，或 TA 是合照参与者），
+    这样按人物筛选时能同时看到其单人照与合照（与前端筛选逻辑一致）。"""
     pcounts, rcounts = {}, {}
+    group_total = 0
     for g in snap:
         for p in g:
+            if p.is_group:
+                group_total += 1
+            pids = set()
             if p.person_id is not None:
-                pcounts[p.person_id] = pcounts.get(p.person_id, 0) + 1
+                pids.add(p.person_id)
+            for gp in (p.group_pids or []):
+                pids.add(gp)
+            for pid in pids:
+                pcounts[pid] = pcounts.get(pid, 0) + 1
             if p.role_id is not None:
                 rcounts[p.role_id] = rcounts.get(p.role_id, 0) + 1
     persons_db = _load_persons().get('persons', {})
@@ -3075,17 +3086,8 @@ def _photos_view_payload(snap: list, dir_str: str | None = None) -> dict:
                 'name': persons_db.get(str(pid), {}).get('name', ''),
                 'confirmed': persons_db.get(str(pid), {}).get('confirmed', False)}
                for pid in sorted(pcounts.keys())]
-    # 合照类别："含xxx的合照"——合照中含某 coser，按 coser 聚合
-    group_counts = {}
-    for g in snap:
-        for p in g:
-            if p.is_group and p.group_pids:
-                for gpid in p.group_pids:
-                    group_counts[gpid] = group_counts.get(gpid, 0) + 1
-    groups_list = [{'pid': gpid, 'count': cnt,
-                    'name': '含' + (persons_db.get(str(gpid), {}).get('name', '') or ('人物' + str(gpid))) + '的合照',
-                    'color': _person_color(gpid)}
-                   for gpid, cnt in sorted(group_counts.items())]
+    # 合照只提供总数：前端用独立「合照」开关与人物筛选正交组合，
+    # 不再预组合成"含X的合照"（会与单人照混在一起、语义混乱）。
     # 角色：仅当前目录出现的
     roles = [{'id': rid, 'count': rcounts.get(rid, 0), 'color': _person_color(rid + 100),
               'name': roles_db.get(str(rid), {}).get('name', '')}
@@ -3094,7 +3096,7 @@ def _photos_view_payload(snap: list, dir_str: str | None = None) -> dict:
         'dir': current_dir if dir_str is None else dir_str,
         'view': 'photos',
         'groups': [[p.to_dict() for p in g] for g in snap],
-        'persons': persons, 'roles': roles, 'group_photos': groups_list,
+        'persons': persons, 'roles': roles, 'group_total': group_total,
         'pregen_mode': _load_pregen_mode(),
     }
 
@@ -3665,7 +3667,7 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_bg_pregen, daemon=True).start()
             except Exception:
                 pass
-        # 与 api_data 共用同一份载荷：包含 persons/roles/group_photos，
+        # 与 api_data 共用同一份载荷：包含 persons/roles/group_total，
         # 否则从相册首页打开相册后上方分类栏不显示（此前 api_scan 缺这些字段）。
         with _state_lock:
             snap = [[p for p in g] for g in groups]
@@ -4350,7 +4352,7 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#1a1a1a;color:#e
 <div id="logPanel"></div>
 
 <script>
-let DATA=[], GROUPS=[], TP=0, TK=0, CACHE_BUST=0, FILTER_PID=null, FILTER_GROUP=null;
+let DATA=[], GROUPS=[], TP=0, TK=0, CACHE_BUST=0, FILTER_PID=null, ONLY_GROUP=false;
 let VIEW='photos'; // 'albums' | 'photos' | 'persons' | 'person_photos'
 let ALBUM_ROOT=''; // 相册根目录（打开相册时记住，返回时用）
 let ASSIGN_MODE=false, ASSIGN_SEL=new Set();  // 批量指定人物/角色模式（统一入口在分类栏）
@@ -4411,27 +4413,21 @@ function renderPhotos(){
   let ph='';
   const asg=ASSIGN_MODE;
   ph+='<div class="pbar"><span class="plabel">👤</span>';
-  ph+=`<span class="pchip ${FILTER_PID===null&&FILTER_GROUP===null&&!asg?'on':''}" onclick="setFilter(null)" style="border-color:#666">全部</span>`;
+  ph+=`<span class="pchip ${FILTER_PID===null&&!ONLY_GROUP&&!asg?'on':''}" onclick="setFilter(null)" style="border-color:#666">全部</span>`;
   (DATA.persons||[]).forEach(ps=>{
     const on=FILTER_PID===ps.id;
     const label=ps.name||('人物'+ps.id);
     const unconf=!ps.name&&!ps.confirmed?'border-style:dashed;':'';
     const act=asg?`assignToPerson(${ps.id})`:`setFilter(${ps.id})`;
-    const title=asg?'点此把已选照片指定给该人物':'单击筛选 · 双击改名 · 右键合并 · 拖拽合并';
+    const title=asg?'点此把已选照片指定给该人物':'单击筛选（含其合照） · 双击改名 · 右键合并 · 拖拽合并';
     ph+=`<span class="pchip ${on&&!asg?'on':''}" draggable="${!asg}" onclick="${act}" ondblclick="${asg?'':`renamePerson(${ps.id})`}" oncontextmenu="event.preventDefault();${asg?'':`mergeTo(${ps.id})`}" ondragstart="DRAG_PID=${ps.id}" ondragover="event.preventDefault()" ondrop="mergeDrop(${ps.id})" style="border-color:${ps.color};${on&&!asg?'background:'+ps.color+';':''}${unconf}" title="${title}">${label} ${!ps.name?'🔶':''}<b>${ps.count}</b></span>`;
   });
+  // 合照开关：与人物筛选正交（点人物 + 开合照 = 该人参与的合照）
+  const gt=DATA.group_total||0;
+  ph+=`<span class="pchip ${ONLY_GROUP?'on':''}" onclick="toggleOnlyGroup()" style="border-color:#8e44ad;${ONLY_GROUP?'background:#8e44ad;':''}" title="只看合照（可再叠加人物筛选）">👥 合照 <b>${gt}</b></span>`;
   ph+=`<span class="pchip ${asg?'on':''}" onclick="toggleAssignMode()" style="border-color:#2980b9;${asg?'background:#2980b9;':''}" title="批量指定：开启后点选照片，再点人物完成分配">✎ 指定${asg&&ASSIGN_SEL.size?'('+ASSIGN_SEL.size+')':''}</span>`;
   ph+=`<span class="pchip" onclick="createPerson()" style="border-color:#27ae60" title="新建人物">＋人物</span>`;
   ph+='</div>';
-  // 合照类别筛选条（"含xxx的合照"）
-  if(DATA.group_photos&&DATA.group_photos.length){
-    ph+='<div class="pbar"><span class="plabel">👥</span>';
-    DATA.group_photos.forEach(gp=>{
-      const on=FILTER_GROUP===gp.pid;
-      ph+=`<span class="pchip ${on?'on':''}" onclick="setGroupFilter(${gp.pid})" style="border-color:${gp.color};${on?'background:'+gp.color:''}">${gp.name} <b>${gp.count}</b></span>`;
-    });
-    ph+='</div>';
-  }
   // 角色栏：批量指定时点角色分配；否则仅双击改名
   ph+='<div class="pbar"><span class="plabel">🎭</span>';
   (DATA.roles||[]).forEach(rl=>{
@@ -4444,12 +4440,11 @@ function renderPhotos(){
   // 分类栏整体包裹进吸顶容器：滚动照片时固定顶部
   let h=ph?`<div class="pbar-wrap">${ph}</div>`:'';
   GROUPS.forEach((g,gi)=>{
-    let vis=g.filter(p=>(FILTER_PID===null||p.person_id===FILTER_PID)&&(FILTER_GROUP===null||(p.is_group&&p.group_pids&&p.group_pids.includes(FILTER_GROUP))||(!p.is_group&&p.person_id===FILTER_GROUP))&&_passScoreFilter(p)&&_passTagFilter(p));
+    let vis=g.filter(p=>_passPersonFilter(p)&&_passScoreFilter(p)&&_passTagFilter(p));
     if(vis.length===0) return;
-    h+=`<div class="grp"><div class="ghdr">组${gi+1} — ${g.length}张${(FILTER_PID!==null||FILTER_GROUP!==null)?' (筛选'+vis.length+')':''}</div><div class="photos">`;
+    h+=`<div class="grp"><div class="ghdr">组${gi+1} — ${g.length}张${(FILTER_PID!==null||ONLY_GROUP)?' (筛选'+vis.length+')':''}</div><div class="photos">`;
     g.forEach((p,pi)=>{
-      if(FILTER_PID!==null && p.person_id!==FILTER_PID) return;
-      if(FILTER_GROUP!==null && !((p.is_group&&p.group_pids&&p.group_pids.includes(FILTER_GROUP))||(!p.is_group&&p.person_id===FILTER_GROUP))) return;
+      if(!_passPersonFilter(p)) return;
       if(!_passScoreFilter(p)||!_passTagFilter(p)) return;
       if(pi>0 && p.burst!==g[pi-1].burst){
         h+=`</div><div class="sburst">真连拍 ${p.burst+1}</div><div class="photos">`;
@@ -4457,7 +4452,13 @@ function renderPhotos(){
       const b=p.has_raw?'<span class="badge b-r">R</span>':'<span class="badge b-n">J</span>';
       const tagMap={'废片':'#c0392b','闭眼':'#e67e22','欠曝':'#8e44ad','过曝':'#8e44ad','无明显差异':'#7f8c8d','wink':'#27ae60'};
       let tagsHtml=(p.tags||[]).map(t=>`<span class="tag" style="background:${tagMap[t]||'#555'}">${t}</span>`).join('');
-      if(p.is_group) tagsHtml='<span class="tag" style="background:#8e44ad">合照</span>'+tagsHtml;
+      if(p.is_group){
+        // 显示参与者名单（主脸在前），悬停看全部
+        const gp=(p.group_pids||[]);
+        const names=gp.map(id=>_pname(id));
+        const shown=names.slice(0,2).join('·')+(names.length>2?'+':(names.length===0?'':''));
+        tagsHtml=`<span class="tag" style="background:#8e44ad" title="合照参与者：${names.join('、')}">合照 ${shown}</span>`+tagsHtml;
+      }
       if(p.merge_pending) tagsHtml='<span class="tag" style="background:#f1c40f">🔶待确认</span>'+tagsHtml;
       const pColor=p.person_id!==null?_pcol(p.person_id):'transparent';
       const rColor=p.role_id!==null?_rcol(p.role_id):'transparent';
@@ -4479,8 +4480,20 @@ function renderPhotos(){
   document.getElementById('grp').innerHTML=h;upd()
 }
 function _pcol(pid){const P=['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#e91e63','#00bcd4','#f1c40f'];return P[pid%P.length]}
-function setFilter(pid){FILTER_PID=pid;FILTER_GROUP=null;render()}
-function setGroupFilter(pid){FILTER_GROUP=FILTER_GROUP===pid?null:pid;FILTER_PID=null;render()}
+// 人物筛选：该人出现过的所有照片（主脸是 TA，或 TA 是合照参与者）
+function _matchPerson(p,pid){
+  if(pid===null) return true;
+  if(p.person_id===pid) return true;
+  return !!(p.group_pids&&p.group_pids.includes(pid));
+}
+// 人物 + 合照开关（正交组合）
+function _passPersonFilter(p){
+  if(!_matchPerson(p,FILTER_PID)) return false;
+  if(ONLY_GROUP && !p.is_group) return false;
+  return true;
+}
+function setFilter(pid){FILTER_PID=pid;render()}
+function toggleOnlyGroup(){ONLY_GROUP=!ONLY_GROUP;render()}
 
 // ── 相册列表视图（跨根目录聚合）──────────────
 function _albumCard(a){
