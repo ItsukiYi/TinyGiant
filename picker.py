@@ -2807,13 +2807,15 @@ def _build_album_index(root: Path) -> list:
                     date_str = ts.strftime('%Y-%m-%d')
                 except OSError:
                     pass
-        elif cover_path and not Path(cover_path).exists():
+        if cover_path and not Path(cover_path).is_file():
             # 封面路径失效（如归档/整理重命名文件夹后 state.json 里的
-            # 照片绝对路径已过时）：重新扫描找封面，避免封面图消失
+            # 照片绝对路径已过时；或误指向目录）：重新扫描找封面，避免封面图消失
             try:
                 _, cover_path = _album_count_and_cover(d)
             except Exception:
-                pass
+                cover_path = ''
+            if cover_path and not Path(cover_path).is_file():
+                cover_path = ''
         if photo_count == 0:
             continue  # 非照片文件夹，跳过
         albums.append({
@@ -3517,6 +3519,10 @@ class Handler(BaseHTTPRequestHandler):
             if not safe or not safe.exists():
                 return self._placeholder()
             path = safe
+            # 封面路径必须指向文件：相册无封面时前端会回退传相册目录，
+            # 直接判掉，避免拿目录去解码导致 PermissionError 刷日志
+            if not path.is_file():
+                return self._placeholder()
             # 封面缩略图：读按路径哈希的缓存（无 id 场景，避免每次重算）
             if size <= 500:
                 data = _read_cover_cache(path)
@@ -4645,7 +4651,7 @@ function _albumCard(a){
   const tidyBtn=`<button class="arch-btn ${st==='tidied'?'on':''}" onclick="event.stopPropagation();setFolderState('${a.path.replace(/\\/g,'\\\\\\\\')}','${st==='tidied'?'':'tidied'}')" title="${st==='tidied'?'取消整理':'标记为已整理'}">${st==='tidied'?'取消整理':'📋 整理'}</button>`;
   const archBtn=`<button class="arch-btn ${st==='archived'?'on':''}" onclick="event.stopPropagation();setFolderState('${a.path.replace(/\\/g,'\\\\\\\\')}','${st==='archived'?'':'archived'}')" title="${st==='archived'?'取消归档':'标记为已归档'}">${st==='archived'?'取消归档':'📦 归档'}</button>`;
   return `<div class="acard ${st==='archived'?'arch':''}" onclick="openAlbum('${a.path.replace(/\\/g,'\\\\\\\\')}')">
-    <div class="acover"><img src="/thumb?p=${encodeURIComponent(a.cover_path||a.path)}&v=${CACHE_BUST}" loading="lazy" onerror="this.style.display='none'"></div>
+    <div class="acover">${a.cover_path?`<img src="/thumb?p=${encodeURIComponent(a.cover_path)}&v=${CACHE_BUST}" loading="lazy" onerror="this.style.display='none'">`:'<span class="picon">📷</span>'}</div>
     <div class="ainfo"><div class="aname">${a.name}${tidyBadge}${archBadge}</div>
     <div class="ameta">${a.photo_count}张 · ${a.date||''}</div>
     <div class="adots">${pColors}${tidyBtn}${archBtn}</div></div></div>`;
